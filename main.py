@@ -3,9 +3,12 @@ import json
 import os
 import shutil
 import zipfile
+import tempfile
+import atexit
+import uuid
 from pathlib import Path
 from PySide2 import QtWidgets, QtCore, QtGui
-from NodeGraphQt import NodeGraph, PropertiesBinWidget
+from NodeGraphQt import NodeGraph
 
 # NodeTreeWidget은 선택적 (버전에 따라 없을 수 있음)
 try:
@@ -28,6 +31,104 @@ from nodes import (
     LoopNode,
     ConclusionNode
 )
+
+
+def ensure_attached_file_property(node):
+    """Ensure node has a proper attached_file property."""
+    if not node:
+        return False
+    try:
+        node.get_property('attached_file')
+        return True
+    except Exception:
+        pass
+    try:
+        if hasattr(node, 'create_property'):
+            node.create_property('attached_file', '', widget_type=None)
+        elif hasattr(node, 'model') and hasattr(node.model, 'set_property'):
+            node.model.set_property('attached_file', '')
+        elif hasattr(node, '_properties'):
+            node._properties['attached_file'] = ''
+        return True
+    except Exception as e:
+        print(f"⚠️ attached_file 속성 생성 실패: {e}")
+        return False
+
+
+def set_attached_file(node, value):
+    """Set attached file path on node (property + fallback attribute)."""
+    if not node:
+        return
+    value = value or ''
+
+    try:
+        path_obj = Path(value)
+        if path_obj.is_absolute() and path_obj.exists():
+            unique_name = f"{path_obj.stem}_{uuid.uuid4().hex[:8]}{path_obj.suffix}"
+            dest_path = attachments_dir / unique_name
+            shutil.copy2(path_obj, dest_path)
+            value = (ATTACHMENTS_VIRTUAL_ROOT / dest_path.name).as_posix()
+    except Exception as e:
+        print(f"⚠️ 첨부 파일 복사 실패: {e}")
+
+    ensure_attached_file_property(node)
+    try:
+        node.set_property('attached_file', value)
+    except Exception as e:
+        print(f"⚠️ attached_file 속성 설정 실패: {e}")
+    setattr(node, '_attached_file_path', value)
+
+
+def get_attached_file(node):
+    """Get attached file path from node (property or fallback attribute)."""
+    if not node:
+        return ''
+    ensure_attached_file_property(node)
+    try:
+        value = node.get_property('attached_file')
+        if isinstance(value, str):
+            if value:
+                setattr(node, '_attached_file_path', value)
+            return value if value else getattr(node, '_attached_file_path', '')
+    except Exception:
+        pass
+    return getattr(node, '_attached_file_path', '')
+
+
+ATTACHMENTS_VIRTUAL_ROOT = Path('attachments')
+attachments_dir = Path(tempfile.mkdtemp(prefix='sdc_logiccanvas_attachments_'))
+print(f"✅ 임시 첨부 폴더 준비 완료: {attachments_dir}")
+
+
+def clear_attachments_dir():
+    """임시 첨부 폴더 비우기."""
+    try:
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        for child in attachments_dir.iterdir():
+            if child.is_file():
+                child.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(child, ignore_errors=True)
+    except Exception as e:
+        print(f"⚠️ 첨부 폴더 정리 실패: {e}")
+
+
+def resolve_attachment_path(path_str):
+    """노드 속성에 저장된 첨부 경로를 실제 파일 경로로 변환."""
+    if not path_str:
+        return None
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    parts = path.parts
+    if parts and parts[0] == ATTACHMENTS_VIRTUAL_ROOT.name:
+        relative = Path(*parts[1:]) if len(parts) > 1 else Path()
+    else:
+        relative = path
+    return (attachments_dir / relative).resolve()
+
+
+atexit.register(lambda: shutil.rmtree(attachments_dir, ignore_errors=True))
 
 
 def export_to_json(graph, filename='workflow_export.json'):
@@ -120,7 +221,7 @@ def export_to_json(graph, filename='workflow_export.json'):
         }
         
         # 파일 첨부 정보 저장
-        attached_file = node.get_property('attached_file') or ''
+        attached_file = get_attached_file(node) or ''
         if attached_file:
             step['attached_file'] = attached_file
         
@@ -220,9 +321,9 @@ def export_to_json(graph, filename='workflow_export.json'):
         if attachments_dir.exists():
             for file_path in attachments_dir.rglob('*'):
                 if file_path.is_file():
-                    # 상대 경로로 저장
-                    arcname = file_path.relative_to(Path.cwd())
-                    zipf.write(file_path, arcname)
+                    rel_path = file_path.relative_to(attachments_dir)
+                    arcname = ATTACHMENTS_VIRTUAL_ROOT / rel_path
+                    zipf.write(file_path, str(arcname).replace('\\', '/'))
                     print(f"  📎 첨부 파일 추가: {arcname}")
     
     print(f"✅ 워크플로우가 '{flow_filename}' 파일로 저장되었습니다!")
@@ -239,6 +340,7 @@ def load_from_json(graph, filename):
     JSON 파일인 경우: 기존 방식대로 로드 (하위 호환성)
     """
     try:
+        clear_attachments_dir()
         # ZIP 파일인지 확인 (.flow 또는 .zip)
         if filename.endswith('.flow') or filename.endswith('.zip'):
             # ZIP 파일에서 불러오기
@@ -259,15 +361,17 @@ def load_from_json(graph, filename):
                 # attachments 폴더 추출
                 attachments_in_zip = [f for f in zipf.namelist() if f.startswith('attachments/')]
                 if attachments_in_zip:
-                    # attachments 폴더에 파일 추출
                     for file_info in attachments_in_zip:
-                        if not file_info.endswith('/'):  # 디렉토리가 아닌 파일만
-                            # 파일 추출
-                            dest_path = Path(file_info)
-                            dest_path.parent.mkdir(parents=True, exist_ok=True)
-                            with zipf.open(file_info) as source, open(dest_path, 'wb') as target:
-                                target.write(source.read())
-                            print(f"  📎 첨부 파일 복원: {file_info}")
+                        if file_info.endswith('/'):
+                            continue
+                        rel_path = Path(file_info)
+                        if rel_path.parts and rel_path.parts[0] == ATTACHMENTS_VIRTUAL_ROOT.name:
+                            rel_path = Path(*rel_path.parts[1:]) if len(rel_path.parts) > 1 else Path()
+                        dest_path = (attachments_dir / rel_path).resolve()
+                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+                        with zipf.open(file_info) as source, open(dest_path, 'wb') as target:
+                            target.write(source.read())
+                        print(f"  📎 첨부 파일 복원: {file_info} -> {dest_path}")
         else:
             # 기존 JSON 파일 방식 (하위 호환성)
             with open(filename, 'r', encoding='utf-8') as f:
@@ -321,19 +425,8 @@ def load_from_json(graph, filename):
             # 노드 생성
             node = graph.create_node(node_type, name=step.get('name', f'노드 {idx+1}'), pos=pos)
             
-            # 노드 생성 후 attached_file 속성 추가 (없으면 추가)
-            if node:
-                try:
-                    try:
-                        node.get_property('attached_file')
-                    except:
-                        # 속성이 없으면 추가
-                        if hasattr(node, 'model') and hasattr(node.model, 'set_property'):
-                            node.model.set_property('attached_file', '')
-                        elif hasattr(node, '_properties'):
-                            node._properties['attached_file'] = ''
-                except:
-                    pass
+            # 노드 생성 후 attached_file 속성 보장
+            ensure_attached_file_property(node)
             
             # 노드 생성 후 위치 재설정 (확실하게)
             if node and 'position' in step:
@@ -419,7 +512,7 @@ def load_from_json(graph, filename):
                 
                 # 파일 첨부 정보 불러오기 (모든 노드 타입에 공통)
                 if 'attached_file' in step:
-                    node.set_property('attached_file', step['attached_file'])
+                    set_attached_file(node, step['attached_file'])
                 
                 step_id = step.get('id')
                 created_nodes[step_id] = node
@@ -530,10 +623,6 @@ if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
 
     # 0. attachments 폴더 생성 (파일 첨부용)
-    attachments_dir = Path('attachments')
-    attachments_dir.mkdir(exist_ok=True)
-    print(f"✅ 첨부 파일 폴더 준비 완료: {attachments_dir.absolute()}")
-
     # 1. 메인 그래프 컨트롤러 생성
     graph = NodeGraph()
 
@@ -650,27 +739,8 @@ if __name__ == '__main__':
                 if node:
                     print(f"✅ 노드 추가 완료: {node_name} at {pos}")
                     
-                    # 노드 생성 직후 attached_file 속성 추가 (없으면 추가)
-                    try:
-                        if not hasattr(node, 'get_property') or not hasattr(node, '_properties'):
-                            # _properties가 없으면 초기화
-                            if not hasattr(node, '_properties'):
-                                node._properties = {}
-                        # attached_file 속성이 없으면 추가
-                        try:
-                            node.get_property('attached_file')
-                        except:
-                            # 속성이 없으면 추가
-                            if hasattr(node, '_properties'):
-                                node._properties['attached_file'] = ''
-                            # 또는 create_property 시도
-                            try:
-                                if hasattr(node, 'create_property'):
-                                    node.create_property('attached_file', '', widget_type=None)
-                            except:
-                                pass
-                    except Exception as e:
-                        print(f"⚠️ attached_file 속성 추가 실패: {e}")
+                    # 노드 생성 직후 attached_file 속성 보장
+                    ensure_attached_file_property(node)
                     
                     # 노드 생성 직후 숫자 속성을 10으로 설정 (속성이 존재하는 경우에만)
                     try:
@@ -893,19 +963,7 @@ if __name__ == '__main__':
                 except:
                     pass
             
-            # 방법 2: PropertiesBinWidget을 통해 접근
-            if not widget and props_bin:
-                try:
-                    if hasattr(props_bin, '_widgets'):
-                        widgets_dict = props_bin._widgets
-                        if node in widgets_dict:
-                            node_widgets = widgets_dict[node]
-                            if prop_name in node_widgets:
-                                widget = node_widgets[prop_name]
-                except:
-                    pass
-            
-            # 방법 3: 노드의 내부 속성 딕셔너리에서 찾기
+            # 방법 2: 노드의 내부 속성 딕셔너리에서 찾기
             if not widget and hasattr(node, '_properties'):
                 try:
                     prop_dict = node._properties
@@ -1564,341 +1622,337 @@ if __name__ == '__main__':
         # 항목 관리 패널은 나중에 추가 (노드 추가 창 다음에)
         data_dock = None  # 나중에 설정
     
-    # 3-3. 우측에 속성 패널 (Dock Widget)
-    props_bin = PropertiesBinWidget(node_graph=graph)
-    
-    # PropertiesBinWidget의 최대 노드 표시 개수를 10으로 설정
-    def set_max_nodes_display():
-        """PropertiesBinWidget의 최대 노드 표시 개수를 10으로 설정"""
+    # 첨부 파일 열기 헬퍼 함수
+    def open_attached_file(node):
+        """노드에 첨부된 파일을 OS 기본 프로그램으로 열기"""
         try:
-            if hasattr(props_bin, 'widget'):
-                bin_widget = props_bin.widget()
-                if bin_widget:
-                    # 숫자 입력 필드(QSpinBox) 찾기
-                    spin_boxes = bin_widget.findChildren(QtWidgets.QSpinBox)
-                    for spin_box in spin_boxes:
-                        try:
-                            # 최대 노드 표시 개수를 10으로 설정
-                            spin_box.blockSignals(True)
-                            spin_box.setValue(10)
-                            spin_box.setMinimum(1)
-                            spin_box.setMaximum(100)  # 최대값도 충분히 크게 설정
-                            spin_box.blockSignals(False)
-                            print(f"  ✅ PropertiesBinWidget 최대 노드 표시 개수: 10으로 설정됨")
-                        except:
-                            pass
-        except Exception as e:
-            print(f"  ⚠️ 최대 노드 표시 개수 설정 실패: {e}")
-    
-    # PropertiesBinWidget에서 숫자 속성 기본값을 10으로 설정
-    def set_property_default_to_10():
-        """숫자 속성(예: z_value)의 기본값을 10으로 설정 (속성이 존재하는 경우에만)"""
-        try:
-            # 모든 노드에 대해 기본값 설정
-            for node in graph.all_nodes():
-                if hasattr(node, 'set_property'):
-                    try:
-                        # 여러 가능한 속성 이름 시도
-                        for prop_name in ['z_value', 'z', 'layer', 'depth']:
-                            try:
-                                # 속성이 존재하는지 먼저 확인
-                                if hasattr(node, '_properties') and prop_name in node._properties:
-                                    node.set_property(prop_name, 10)
-                                elif hasattr(node, 'get_property'):
-                                    # get_property로 존재 여부 확인 (에러가 나지 않으면 존재)
-                                    try:
-                                        node.get_property(prop_name)
-                                        node.set_property(prop_name, 10)
-                                    except:
-                                        pass  # 속성이 없으면 건너뜀
-                            except:
-                                pass
-                    except:
-                        pass
+            attached_file = get_attached_file(node) or ''
+            if not attached_file:
+                return False
+            file_path = resolve_attachment_path(attached_file)
+            if not file_path:
+                return False
             
-            # PropertiesBinWidget에서 숫자 속성 위젯의 값도 10으로 설정
-            if hasattr(props_bin, 'widget'):
-                bin_widget = props_bin.widget()
-                if bin_widget:
-                    # 모든 QSpinBox 위젯 찾아서 값 10으로 설정
-                    spin_boxes = bin_widget.findChildren(QtWidgets.QSpinBox)
-                    for spin_box in spin_boxes:
-                        try:
-                            # 현재 값과 관계없이 10으로 설정
-                            if spin_box.value() != 10:
-                                spin_box.setValue(10)
-                        except:
-                            pass
-        except Exception as e:
-            print(f"  ⚠️ 속성 기본값 설정 실패: {e}")
-    
-    # PropertiesBinWidget에 속성 위젯 스타일 적용 함수
-    def apply_property_widget_style():
-        """PropertiesBinWidget에 표시되는 모든 속성 위젯들에 가운데 정렬 스타일 적용 및 여러 줄 입력 필드 교체 및 툴팁 설정"""
-        try:
-            # 선택된 노드 가져오기
-            selected_nodes = graph.selected_nodes()
-            current_node = selected_nodes[0] if selected_nodes else None
-            
-            # PropertiesBinWidget의 내부 위젯 찾기
-            if hasattr(props_bin, 'widget'):
-                bin_widget = props_bin.widget()
-                if bin_widget:
-                    # 모든 노드의 속성 위젯들에 가운데 정렬 적용 및 여러 줄 입력 필드 교체
-                    def apply_center_to_widgets(w, node=None):
-                        """위젯과 그 자식 위젯들에 가운데 정렬 스타일 적용 및 클릭 이벤트 처리 및 툴팁 설정"""
-                        if isinstance(w, QtWidgets.QComboBox):
-                            w.setStyleSheet("QComboBox { text-align: center; font-size: 9px; }")
-                            # 한 번 클릭으로 드롭다운이 열리도록 이벤트 처리
-                            original_mouse_press = w.mousePressEvent
-                            def new_mouse_press(event):
-                                """QComboBox 클릭 시 드롭다운 열기"""
-                                if event.button() == QtCore.Qt.LeftButton:
-                                    w.showPopup()
-                                else:
-                                    original_mouse_press(event)
-                            w.mousePressEvent = new_mouse_press
-                        elif isinstance(w, QtWidgets.QLineEdit):
-                            w.setStyleSheet("QLineEdit { text-align: center; font-size: 9px; }")
-                        elif isinstance(w, QtWidgets.QTextEdit):
-                            w.setStyleSheet("QTextEdit { text-align: center; min-height: 80px; font-size: 9px; }")
-                        elif isinstance(w, QtWidgets.QLabel):
-                            # 모든 라벨을 가운데 정렬 및 폰트 크기 통일 (헤더와 동일하게)
-                            w.setAlignment(QtCore.Qt.AlignCenter)
-                            font = w.font()
-                            font.setPointSize(9)
-                            w.setFont(font)
-                        
-                        # 자식 위젯들도 재귀적으로 처리
-                        for child in w.findChildren(QtWidgets.QWidget):
-                            apply_center_to_widgets(child, node)
-                    
-                    apply_center_to_widgets(bin_widget, current_node)
-        except Exception as e:
-            pass  # 실패해도 계속 진행
-    
-    # 파일 첨부 기능: PropertiesBinWidget에 파일 선택 버튼 추가
-    def add_file_attachment_button():
-        """PropertiesBinWidget에 파일 첨부 버튼 추가"""
-        try:
-            if hasattr(props_bin, 'widget'):
-                bin_widget = props_bin.widget()
-                if bin_widget:
-                    # 파일 첨부 버튼 찾기 (이미 있으면 재사용)
-                    file_btn = bin_widget.findChild(QtWidgets.QPushButton, 'file_attachment_btn')
-                    if not file_btn:
-                        # 버튼 생성
-                        file_btn = QtWidgets.QPushButton('📎 파일 첨부')
-                        file_btn.setObjectName('file_attachment_btn')
-                        file_btn.setMaximumHeight(30)
-                        
-                        # 버튼 클릭 이벤트
-                        def on_file_btn_clicked():
-                            selected = graph.selected_nodes()
-                            if not selected:
-                                QtWidgets.QMessageBox.warning(None, '알림', '노드를 먼저 선택하세요.')
-                                return
-                            
-                            node = selected[0]
-                            
-                            # 파일 선택 다이얼로그
-                            file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                                None,
-                                '파일 선택',
-                                '',
-                                '모든 파일 (*.*);;이미지 (*.png *.jpg *.jpeg *.gif *.bmp);;문서 (*.pdf *.doc *.docx *.txt);;기타 (*.*)'
-                            )
-                            
-                            if file_path:
-                                try:
-                                    # 파일을 attachments 폴더로 복사
-                                    source_path = Path(file_path)
-                                    file_name = source_path.name
-                                    # 파일명에 노드 ID 추가하여 고유하게 만들기
-                                    node_id = node.id if hasattr(node, 'id') else str(id(node))
-                                    file_stem = source_path.stem
-                                    file_suffix = source_path.suffix
-                                    unique_name = f"{file_stem}_{node_id[:8]}{file_suffix}"
-                                    dest_path = attachments_dir / unique_name
-                                    
-                                    # 파일 복사
-                                    shutil.copy2(source_path, dest_path)
-                                    
-                                    # 노드 속성에 상대 경로 저장
-                                    relative_path = f"attachments/{unique_name}"
-                                    node.set_property('attached_file', relative_path)
-                                    
-                                    QtWidgets.QMessageBox.information(
-                                        None, 
-                                        '성공', 
-                                        f'파일이 첨부되었습니다.\n{file_name}\n\n노드를 더블클릭하면 파일이 열립니다.'
-                                    )
-                                    print(f"✅ 파일 첨부 완료: {relative_path}")
-                                except Exception as e:
-                                    QtWidgets.QMessageBox.critical(None, '오류', f'파일 첨부 실패: {str(e)}')
-                                    print(f"❌ 파일 첨부 실패: {e}")
-                        
-                        file_btn.clicked.connect(on_file_btn_clicked)
-                        
-                        # PropertiesBinWidget의 레이아웃에 버튼 추가
-                        # PropertiesBinWidget의 구조에 따라 다를 수 있음
-                        # 일단 bin_widget의 자식 위젯 중 QVBoxLayout 찾기
-                        layouts = bin_widget.findChildren(QtWidgets.QVBoxLayout)
-                        if layouts:
-                            layouts[0].addWidget(file_btn)
-                        else:
-                            # 레이아웃이 없으면 직접 추가 시도
-                            bin_widget.layout().addWidget(file_btn) if bin_widget.layout() else None
-        except Exception as e:
-            print(f"⚠️ 파일 첨부 버튼 추가 실패: {e}")
-    
-    # 노드 더블클릭 이벤트로 파일 열기
-    def on_node_double_clicked(node):
-        """노드 더블클릭 시 첨부 파일 열기"""
-        try:
-            attached_file = node.get_property('attached_file') or ''
-            if attached_file:
-                file_path = Path(attached_file)
-                # 상대 경로인 경우 절대 경로로 변환
-                if not file_path.is_absolute():
-                    file_path = Path.cwd() / file_path
-                
-                if file_path.exists():
-                    # OS 기본 프로그램으로 파일 열기
-                    if sys.platform == 'win32':
-                        os.startfile(str(file_path))
-                    elif sys.platform == 'darwin':
-                        os.system(f'open "{file_path}"')
-                    else:
-                        os.system(f'xdg-open "{file_path}"')
-                    print(f"✅ 파일 열기: {file_path}")
+            if file_path.exists():
+                # OS 기본 프로그램으로 파일 열기
+                if sys.platform == 'win32':
+                    os.startfile(str(file_path))
+                elif sys.platform == 'darwin':
+                    os.system(f'open "{file_path}"')
                 else:
-                    QtWidgets.QMessageBox.warning(
-                        None, 
-                        '파일 없음', 
-                        f'첨부된 파일을 찾을 수 없습니다.\n{file_path}'
-                    )
+                    os.system(f'xdg-open "{file_path}"')
+                print(f"✅ 파일 열기: {file_path}")
+                return True
+            else:
+                QtWidgets.QMessageBox.warning(
+                    None, 
+                    '파일 없음', 
+                    f'첨부된 파일을 찾을 수 없습니다.\n{file_path}'
+                )
+                return False
         except Exception as e:
             print(f"⚠️ 파일 열기 실패: {e}")
+            QtWidgets.QMessageBox.critical(None, '오류', f'파일을 열 수 없습니다.\n{e}')
+            return False
     
-    # 노드 더블클릭 이벤트 연결
-    try:
-        if hasattr(graph, 'node_double_clicked'):
-            graph.node_double_clicked.connect(on_node_double_clicked)
-        elif hasattr(graph, 'nodes_double_clicked'):
-            graph.nodes_double_clicked.connect(lambda nodes: on_node_double_clicked(nodes[0]) if nodes else None)
-    except Exception as e:
-        print(f"⚠️ 노드 더블클릭 이벤트 연결 실패: {e}")
-        # 대체 방법: viewer의 이벤트 직접 연결
-        try:
-            viewer = graph.viewer()
-            if viewer:
-                # QGraphicsView의 mouseDoubleClickEvent를 오버라이드
-                original_double_click = viewer.mouseDoubleClickEvent
-                def custom_double_click(event):
-                    original_double_click(event)
-                    # 더블클릭된 노드 찾기
-                    selected = graph.selected_nodes()
-                    if selected:
-                        on_node_double_clicked(selected[0])
-                viewer.mouseDoubleClickEvent = custom_double_click
-        except:
-            pass
     
-    # 노드 선택 시 속성 창 표시 및 스타일 적용
-    try:
-        if hasattr(graph, 'nodes_selected'):
-            def on_nodes_selected():
-                # 노드 선택 시 속성 창 표시 (한 번 클릭으로)
-                selected = graph.selected_nodes()
-                if selected and props_dock:
-                    # 속성 창이 숨겨져 있으면 표시
-                    if props_dock.isHidden():
-                        props_dock.show()
-                    # 속성 창을 활성화
-                    props_dock.raise_()
-                # 약간의 지연 후 스타일 적용 및 최대 노드 표시 개수 설정 (위젯이 완전히 생성된 후)
-                QtCore.QTimer.singleShot(50, set_max_nodes_display)
-                QtCore.QTimer.singleShot(150, apply_property_widget_style)
-                QtCore.QTimer.singleShot(200, add_file_attachment_button)  # 파일 첨부 버튼 추가
-            graph.nodes_selected.connect(on_nodes_selected)
-    except:
-        pass
+    # 3-3. 파일 첨부 패널 (별도 Dock Widget)
+    file_attachment_panel = QWidget()
+    file_attachment_layout = QVBoxLayout()
+    file_attachment_layout.setContentsMargins(10, 10, 10, 10)
+    file_attachment_layout.setSpacing(10)
+    file_attachment_panel.setLayout(file_attachment_layout)
     
-    # 초기 로드 시에도 최대 노드 표시 개수 설정 (여러 번 시도)
-    try:
-        for delay in [100, 200, 300, 500, 1000, 2000]:
-            QtCore.QTimer.singleShot(delay, set_max_nodes_display)
-    except:
-        pass
+    # 제목
+    file_label = QtWidgets.QLabel("📎 파일 첨부")
+    file_label.setStyleSheet("font-weight: bold; font-size: 16px; padding: 12px;")
+    file_attachment_layout.addWidget(file_label)
     
-    # PropertiesBinWidget에 속성 변경 이벤트 연결하여 동적 필드 표시/숨김 처리
-    try:
-        def on_property_changed(node, prop_name, prop_value):
-            """속성 변경 시 호출되는 함수"""
+    # 선택된 노드 표시
+    selected_node_label = QtWidgets.QLabel("선택된 노드: 없음")
+    selected_node_label.setStyleSheet("font-size: 13px; color: #888; padding: 6px;")
+    file_attachment_layout.addWidget(selected_node_label)
+    
+    # 파일 선택 버튼
+    file_select_btn = QPushButton("📁 파일 선택")
+    file_select_btn.setMinimumHeight(40)
+    file_select_btn.setStyleSheet("font-size: 13px; font-weight: bold;")
+    file_attachment_layout.addWidget(file_select_btn)
+    
+    # 첨부 파일 정보 라벨
+    attached_file_label = QtWidgets.QLabel("첨부된 파일: (없음)")
+    attached_file_label.setStyleSheet("font-size: 13px; padding: 6px;")
+    attached_file_label.setWordWrap(True)
+    file_attachment_layout.addWidget(attached_file_label)
+    
+    # 파일 열기 버튼
+    open_file_btn = QPushButton("📂 파일 열기")
+    open_file_btn.setMinimumHeight(36)
+    open_file_btn.setStyleSheet("font-size: 13px;")
+    open_file_btn.setEnabled(False)
+    file_attachment_layout.addWidget(open_file_btn)
+    
+    # 파일 삭제 버튼
+    file_delete_btn = QPushButton("🗑️ 파일 삭제")
+    file_delete_btn.setMinimumHeight(36)
+    file_delete_btn.setStyleSheet("font-size: 13px;")
+    file_delete_btn.setEnabled(False)  # 파일이 없으면 비활성화
+    file_attachment_layout.addWidget(file_delete_btn)
+    
+    file_attachment_layout.addStretch()
+    
+    # 파일 첨부 패널 업데이트 함수
+    def update_file_attachment_panel():
+        """선택된 노드에 따라 파일 첨부 패널 업데이트 (모든 노드 지원)"""
+        selected = graph.selected_nodes()
+        if selected and len(selected) > 0:
+            node = selected[0]
+            node_name = node.name if isinstance(node.name, str) else (node.name() if callable(node.name) else str(node.name))
+            selected_node_label.setText(f"선택된 노드: {node_name}")
+            
+            # 첨부 파일 확인
             try:
-                # DataQueryNode의 target_table이 변경되었을 때
-                if hasattr(node, '__class__') and node.__class__.__name__ == 'DataQueryNode':
-                    if prop_name == 'target_table':
-                        # '기타 (직접 입력)'을 선택했을 때만 직접 입력 필드 표시
-                        # PropertiesBinWidget의 위젯을 찾아서 표시/숨김 처리
-                        try:
-                            # props_bin의 내부 위젯 구조를 통해 접근
-                            if hasattr(props_bin, 'widget'):
-                                widget = props_bin.widget()
-                                if widget:
-                                    # target_table_custom 필드를 찾아서 표시/숨김
-                                    # 이 부분은 NodeGraphQt의 내부 구조에 따라 다를 수 있음
-                                    pass
-                        except Exception as e:
-                            print(f"⚠️ 속성 변경 이벤트 처리 오류: {e}")
-            except Exception as e:
-                pass
+                attached_file = get_attached_file(node) or ''
+                if attached_file:
+                    file_path = Path(attached_file)
+                    file_name = file_path.name if file_path.name else attached_file
+                    attached_file_label.setText(f"첨부된 파일: {file_name}")
+                    attached_file_label.setToolTip(attached_file)  # 전체 경로를 툴팁으로 표시
+                    open_file_btn.setEnabled(True)
+                    file_delete_btn.setEnabled(True)
+                else:
+                    attached_file_label.setText("첨부된 파일: (없음)")
+                    attached_file_label.setToolTip('')
+                    open_file_btn.setEnabled(False)
+                    file_delete_btn.setEnabled(False)
+            except:
+                attached_file_label.setText("첨부된 파일: (없음)")
+                attached_file_label.setToolTip('')
+                open_file_btn.setEnabled(False)
+                file_delete_btn.setEnabled(False)
+        else:
+            selected_node_label.setText("선택된 노드: 없음")
+            attached_file_label.setText("첨부된 파일: (노드를 선택하세요)")
+            attached_file_label.setToolTip('')
+            open_file_btn.setEnabled(False)
+            file_delete_btn.setEnabled(False)
+    
+    # 파일 선택 버튼 클릭 이벤트
+    def on_file_select_clicked():
+        selected = graph.selected_nodes()
+        if not selected:
+            QtWidgets.QMessageBox.warning(None, '알림', '노드를 먼저 선택하세요.')
+            return
         
-        # 속성 변경 시그널 연결 시도
+        node = selected[0]
+        ensure_attached_file_property(node)
+        
+        # 파일 선택 다이얼로그
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None,
+            '파일 선택',
+            '',
+            '모든 파일 (*.*);;이미지 (*.png *.jpg *.jpeg *.gif *.bmp);;문서 (*.pdf *.doc *.docx *.txt);;기타 (*.*)'
+        )
+        
+        if file_path:
+            try:
+                # 파일을 attachments 폴더로 복사
+                source_path = Path(file_path)
+                file_name = source_path.name
+                # 파일명에 노드 ID 추가하여 고유하게 만들기
+                node_id = node.id if hasattr(node, 'id') else str(id(node))
+                file_stem = source_path.stem
+                file_suffix = source_path.suffix
+                unique_name = f"{file_stem}_{node_id[:8]}{file_suffix}"
+                dest_path = attachments_dir / unique_name
+                
+                # 파일 복사
+                shutil.copy2(source_path, dest_path)
+                
+                # 노드 속성에 상대 경로 저장 (attached_file 사용)
+                relative_path = (ATTACHMENTS_VIRTUAL_ROOT / unique_name).as_posix()
+                set_attached_file(node, relative_path)
+                
+                # 패널 업데이트 (즉시 및 약간의 지연 후)
+                update_file_attachment_panel()
+                QtCore.QTimer.singleShot(100, update_file_attachment_panel)
+                
+                QtWidgets.QMessageBox.information(
+                    None, 
+                    '성공', 
+                    f"파일이 첨부되었습니다.\n{file_name}\n\n'📂 파일 열기' 버튼으로 열 수 있습니다."
+                )
+                print(f"✅ 파일 첨부 완료: {relative_path}")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(None, '오류', f'파일 첨부 실패: {str(e)}')
+                print(f"❌ 파일 첨부 실패: {e}")
+    
+    # 파일 열기 버튼 클릭 이벤트
+    def on_open_file_clicked():
+        selected = graph.selected_nodes()
+        if not selected:
+            QtWidgets.QMessageBox.warning(None, '알림', '노드를 먼저 선택하세요.')
+            return
+        
+        node = selected[0]
+        if not open_attached_file(node):
+            QtWidgets.QMessageBox.information(None, '알림', '첨부된 파일이 없습니다.')
+    
+    # 파일 삭제 버튼 클릭 이벤트
+    def on_file_delete_clicked():
+        selected = graph.selected_nodes()
+        if not selected:
+            return
+        
+        node = selected[0]
+        
         try:
-            if hasattr(graph, 'property_changed'):
-                graph.property_changed.connect(on_property_changed)
-        except:
-            pass
-    except Exception as e:
-        print(f"⚠️ PropertiesBinWidget 커스터마이징 실패: {e}")
+            attached_file = get_attached_file(node) or ''
+            if attached_file:
+                real_path = resolve_attachment_path(attached_file)
+                if not real_path:
+                    return
+                reply = QtWidgets.QMessageBox.question(
+                    None,
+                    '파일 삭제',
+                    '첨부된 파일을 삭제하시겠습니까?',
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No
+                )
+                
+                if reply == QtWidgets.QMessageBox.Yes:
+                    # 파일 삭제
+                    if real_path.exists():
+                        real_path.unlink()
+                        print(f"✅ 파일 삭제: {real_path}")
+                    
+                    # 노드 속성에서 제거
+                    set_attached_file(node, '')
+                    
+                    # 패널 업데이트
+                    update_file_attachment_panel()
+                    
+                    QtWidgets.QMessageBox.information(None, '완료', '파일이 삭제되었습니다.')
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, '오류', f'파일 삭제 실패: {str(e)}')
+            print(f"❌ 파일 삭제 실패: {e}")
     
-    # 1. 속성 패널을 먼저 왼쪽에 추가 (맨 위)
-    props_dock = QDockWidget("속성 (Properties)", main_window)
-    props_dock.setWidget(props_bin)
-    props_dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
-    main_window.addDockWidget(QtCore.Qt.LeftDockWidgetArea, props_dock)
-    props_dock.setMinimumWidth(350)
-    props_dock.setMinimumHeight(300)
-    print("✅ 속성 패널 추가 완료 (좌측 상단)")
+    # 이벤트 연결
+    file_select_btn.clicked.connect(on_file_select_clicked)
+    open_file_btn.clicked.connect(on_open_file_clicked)
+    file_delete_btn.clicked.connect(on_file_delete_clicked)
     
-    # 2. 노드 추가 패널을 속성 패널 아래에 추가
-    if not HAS_NODE_TREE:
+    # 파일 첨부 Dock Widget 생성 (좌측 최상단)
+    file_attachment_dock = QDockWidget("📎 파일 첨부", main_window)
+    file_attachment_dock.setWidget(file_attachment_panel)
+    file_attachment_dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+    main_window.addDockWidget(QtCore.Qt.LeftDockWidgetArea, file_attachment_dock)
+    file_attachment_dock.setMinimumWidth(350)
+    file_attachment_dock.setMinimumHeight(300)
+    print("✅ 파일 첨부 패널 추가 완료 (좌측 상단)")
+
+    # 파일 첨부 패널 아래에 노드/데이터 패널 정렬
+    dock_anchor = file_attachment_dock
+
+    if HAS_NODE_TREE:
+        try:
+            if node_dock:
+                main_window.splitDockWidget(dock_anchor, node_dock, QtCore.Qt.Vertical)
+                dock_anchor = node_dock
+        except Exception as e:
+            print(f"⚠️ 노드 트리 Dock 재배치 실패: {e}")
+    else:
         node_dock = QDockWidget("➕ 노드 추가", main_window)
         node_dock.setWidget(node_panel)
         node_dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
         main_window.addDockWidget(QtCore.Qt.LeftDockWidgetArea, node_dock)
-        # 속성 패널 아래에 배치
-        main_window.splitDockWidget(props_dock, node_dock, QtCore.Qt.Vertical)
+        main_window.splitDockWidget(dock_anchor, node_dock, QtCore.Qt.Vertical)
         node_dock.setMinimumWidth(200)
+        dock_anchor = node_dock
         print("✅ 노드 추가 버튼 패널 추가 완료 (좌측 중간)")
-    
-    # 3. 항목 관리 패널을 노드 추가 패널 아래에 추가
+
     data_dock = QDockWidget("📋 항목 관리", main_window)
     data_dock.setWidget(data_panel)
     data_dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
     main_window.addDockWidget(QtCore.Qt.LeftDockWidgetArea, data_dock)
-    # 노드 추가 패널 아래에 배치
-    if not HAS_NODE_TREE and node_dock:
-        main_window.splitDockWidget(node_dock, data_dock, QtCore.Qt.Vertical)
-    else:
-        # NodeTreeWidget이 있는 경우 속성 패널 아래에 배치
-        main_window.splitDockWidget(props_dock, data_dock, QtCore.Qt.Vertical)
+    main_window.splitDockWidget(dock_anchor, data_dock, QtCore.Qt.Vertical)
     data_dock.setMinimumWidth(300)
     data_dock.setMinimumHeight(400)
     print("✅ 항목 관리 패널 추가 완료 (좌측 하단)")
     
+    # 노드 선택/해제 시 파일 첨부 패널 업데이트
+    try:
+        if hasattr(graph, 'nodes_selected'):
+            def on_nodes_selected_for_file():
+                # 선택된 노드가 없을 때도 처리
+                QtCore.QTimer.singleShot(50, update_file_attachment_panel)
+            graph.nodes_selected.connect(on_nodes_selected_for_file)
+        
+        # 노드 선택 해제 이벤트 연결
+        if hasattr(graph, 'nodes_deselected'):
+            def on_nodes_deselected_for_file():
+                QtCore.QTimer.singleShot(50, update_file_attachment_panel)
+            graph.nodes_deselected.connect(on_nodes_deselected_for_file)
+    except:
+        pass
+    
+    # QGraphicsScene의 selectionChanged 시그널 사용 (가장 확실한 방법)
+    try:
+        viewer = graph.viewer()
+        if viewer:
+            view = None
+            if hasattr(viewer, 'view'):
+                view = viewer.view
+            elif hasattr(viewer, 'get_view'):
+                view = viewer.get_view()
+            elif isinstance(viewer, QtWidgets.QGraphicsView):
+                view = viewer
+            
+            if view and view.scene():
+                scene = view.scene()
+                # selectionChanged 시그널 연결
+                scene.selectionChanged.connect(lambda: QtCore.QTimer.singleShot(50, update_file_attachment_panel))
+                print("✅ Scene selectionChanged 이벤트 연결 완료")
+    except Exception as e:
+        print(f"⚠️ Scene selectionChanged 이벤트 연결 실패: {e}")
+    
+    # 주기적으로 선택 상태 확인 (백업 방법)
+    selection_check_timer = QtCore.QTimer()
+    selection_check_timer.timeout.connect(update_file_attachment_panel)
+    selection_check_timer.start(200)  # 200ms마다 확인
+    print("✅ 선택 상태 주기적 확인 타이머 시작")
+    
+    # 캔버스 클릭 시 선택 해제 감지 (추가 보완)
+    try:
+        viewer = graph.viewer()
+        if viewer:
+            view = None
+            if hasattr(viewer, 'view'):
+                view = viewer.view
+            elif hasattr(viewer, 'get_view'):
+                view = viewer.get_view()
+            elif isinstance(viewer, QtWidgets.QGraphicsView):
+                view = viewer
+            
+            if view:
+                original_mouse_press = view.mousePressEvent
+                
+                def custom_mouse_press(event):
+                    """커스텀 마우스 클릭 이벤트 핸들러"""
+                    # 원래 이벤트 처리
+                    original_mouse_press(event)
+                    
+                    # 약간의 지연 후 패널 업데이트 (선택 상태가 변경된 후)
+                    QtCore.QTimer.singleShot(100, update_file_attachment_panel)
+                
+                view.mousePressEvent = custom_mouse_press
+                print("✅ 캔버스 클릭 이벤트 연결 완료")
+    except Exception as e:
+        print(f"⚠️ 캔버스 클릭 이벤트 연결 실패: {e}")
+    
+    # 초기 상태 설정
+    update_file_attachment_panel()
     
     # 3-4. 메인 윈도우 표시
     main_window.show()
@@ -2956,6 +3010,8 @@ if __name__ == '__main__':
             nodes = graph.all_nodes()
             for node in nodes:
                 graph.delete_node(node)
+            clear_attachments_dir()
+            update_file_attachment_panel()
             print("✅ 새 워크플로우를 시작합니다.")
             QtWidgets.QMessageBox.information(
                 main_window,
@@ -2979,6 +3035,7 @@ if __name__ == '__main__':
                     result = load_from_json(graph, filename)
                     if result:
                         file_type = "워크플로우 파일" if filename.endswith('.flow') else ("ZIP 파일" if filename.endswith('.zip') else "JSON 파일")
+                        update_file_attachment_panel()
                         QtWidgets.QMessageBox.information(
                             main_window,
                             "불러오기 완료 ✅",

@@ -313,8 +313,6 @@ class ScreenNode(BaseNode):
         
         self.add_text_input('screen_elements', '확인 요소')
         self.set_property('screen_elements', '확인할 화면 요소를 입력하세요 (예: 버튼, 텍스트, 상태)')
-        
-        # 파일 첨부 속성은 노드 생성 후 main.py에서 동적으로 추가됨
 
 # 2-3. SQL 노드 (SQL Node) - SQL 쿼리 데이터 소스
 class SQLNode(BaseNode):
