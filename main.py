@@ -1,4 +1,6 @@
 import sys
+import ctypes
+from ctypes import wintypes
 import json
 import os
 import shutil
@@ -97,6 +99,7 @@ def get_attached_file(node):
 
 ATTACHMENTS_VIRTUAL_ROOT = Path('attachments')
 attachments_dir = Path(tempfile.mkdtemp(prefix='sdc_logiccanvas_attachments_'))
+APP_ICON_PATH = (Path(__file__).parent / 'icon.png').resolve()
 print(f"✅ 임시 첨부 폴더 준비 완료: {attachments_dir}")
 
 
@@ -128,13 +131,537 @@ def resolve_attachment_path(path_str):
     return (attachments_dir / relative).resolve()
 
 
+class ResizeHandle(QtWidgets.QWidget):
+    """Transparent widget that captures resize drags on a specific edge."""
+
+    def __init__(self, parent, direction, cursor):
+        super().__init__(parent)
+        self._direction = direction
+        self._parent = parent
+        self.setCursor(cursor)
+        self.setMouseTracking(True)
+        self.setStyleSheet("background: transparent;")
+
+    def direction(self):
+        return self._direction
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self._parent._start_resize(self._direction, event.globalPos())
+            event.accept()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & QtCore.Qt.LeftButton:
+            self._parent._perform_resize(event.globalPos())
+            event.accept()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._parent._end_resize()
+        super().mouseReleaseEvent(event)
+
+
+class FramelessMainWindow(QtWidgets.QMainWindow):
+    """Custom QMainWindow with frameless chrome and manual resize grip."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.Window
+            | QtCore.Qt.WindowSystemMenuHint
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
+        self.setMouseTracking(True)
+        self._state_callback = None
+
+        self._size_grip = QtWidgets.QSizeGrip(self)
+        self._size_grip.setFixedSize(18, 18)
+        self._size_grip.setStyleSheet(
+            "background-color: #2f2f35; border: 1px solid #3d3d45; border-radius: 4px;"
+        )
+        self._size_grip.hide()
+        self._edge_margin = 8
+        self._resizing = False
+        self._resize_direction = None
+        self._resize_start_pos = QtCore.QPoint()
+        self._resize_start_geom = QtCore.QRect()
+        self._init_resize_handles()
+
+    def set_state_change_callback(self, callback):
+        self._state_callback = callback
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.WindowStateChange:
+            if self._size_grip:
+                self._size_grip.setVisible(not self.isMaximized())
+            if self._state_callback:
+                self._state_callback()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._size_grip:
+            self._size_grip.move(
+                self.width() - self._size_grip.width() - 6,
+                self.height() - self._size_grip.height() - 6,
+            )
+            if not self.isMaximized() and not self._size_grip.isVisible():
+                self._size_grip.show()
+        self._update_resize_handles()
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform != 'win32':
+            return super().nativeEvent(eventType, message)
+
+        msg = ctypes.wintypes.MSG.from_address(message.__int__())
+        WM_NCHITTEST = 0x0084
+
+        try:
+            msg = ctypes.cast(message, ctypes.POINTER(wintypes.MSG)).contents
+        except Exception:
+            return super().nativeEvent(eventType, message)
+
+        if msg.message == WM_NCHITTEST and not self.isMaximized():
+            hwnd = msg.hWnd
+            rect = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            screen_x = msg.pt.x
+            screen_y = msg.pt.y
+            x = screen_x - rect.left
+            y = screen_y - rect.top
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            m = self._edge_margin
+
+            if y <= m:
+                if x <= m:
+                    return True, 13  # HTTOPLEFT
+                if x >= w - m:
+                    return True, 14  # HTTOPRIGHT
+                return True, 12  # HTTOP
+            if y >= h - m:
+                if x <= m:
+                    return True, 16  # HTBOTTOMLEFT
+                if x >= w - m:
+                    return True, 17  # HTBOTTOMRIGHT
+                return True, 15  # HTBOTTOM
+            if x <= m:
+                return True, 10  # HTLEFT
+            if x >= w - m:
+                return True, 11  # HTRIGHT
+
+        return super().nativeEvent(eventType, message)
+
+    def _init_resize_handles(self):
+        self._resize_handles = []
+        specs = [
+            ('left', QtCore.Qt.SizeHorCursor),
+            ('right', QtCore.Qt.SizeHorCursor),
+            ('top', QtCore.Qt.SizeVerCursor),
+            ('bottom', QtCore.Qt.SizeVerCursor),
+            ('top-left', QtCore.Qt.SizeFDiagCursor),
+            ('top-right', QtCore.Qt.SizeBDiagCursor),
+            ('bottom-left', QtCore.Qt.SizeBDiagCursor),
+            ('bottom-right', QtCore.Qt.SizeFDiagCursor),
+        ]
+        for direction, cursor in specs:
+            handle = ResizeHandle(self, direction, cursor)
+            handle.lower()
+            self._resize_handles.append(handle)
+        self._update_resize_handles()
+
+    def _update_resize_handles(self):
+        if not hasattr(self, '_resize_handles'):
+            return
+        rect = self.rect()
+        m = self._edge_margin
+        inner_height = max(0, rect.height() - 2 * m)
+        inner_width = max(0, rect.width() - 2 * m)
+        for handle in self._resize_handles:
+            dir_ = handle.direction()
+            if self.isMaximized():
+                handle.hide()
+                continue
+            handle.show()
+            if dir_ == 'left':
+                handle.setGeometry(0, m, m, inner_height)
+            elif dir_ == 'right':
+                handle.setGeometry(rect.width() - m, m, m, inner_height)
+            elif dir_ == 'top':
+                handle.setGeometry(m, 0, inner_width, m)
+            elif dir_ == 'bottom':
+                handle.setGeometry(m, rect.height() - m, inner_width, m)
+            elif dir_ == 'top-left':
+                handle.setGeometry(0, 0, m * 2, m * 2)
+            elif dir_ == 'top-right':
+                handle.setGeometry(rect.width() - m * 2, 0, m * 2, m * 2)
+            elif dir_ == 'bottom-left':
+                handle.setGeometry(0, rect.height() - m * 2, m * 2, m * 2)
+            elif dir_ == 'bottom-right':
+                handle.setGeometry(rect.width() - m * 2, rect.height() - m * 2, m * 2, m * 2)
+            handle.raise_()
+
+    def _start_resize(self, direction, global_pos):
+        if self.isMaximized():
+            return
+        self._resizing = True
+        self._resize_direction = direction
+        self._resize_start_pos = global_pos
+        self._resize_start_geom = self.geometry()
+
+    def _perform_resize(self, global_pos):
+        if not self._resizing or not self._resize_direction:
+            return
+
+        dx = global_pos.x() - self._resize_start_pos.x()
+        dy = global_pos.y() - self._resize_start_pos.y()
+        geom = QtCore.QRect(self._resize_start_geom)
+
+        left = 'left' in self._resize_direction
+        right = 'right' in self._resize_direction
+        top = 'top' in self._resize_direction
+        bottom = 'bottom' in self._resize_direction
+
+        if left:
+            new_left = self._resize_start_geom.left() + dx
+            if self._resize_start_geom.right() - new_left >= self.minimumWidth():
+                geom.setLeft(new_left)
+        elif right:
+            new_right = self._resize_start_geom.right() + dx
+            if new_right - self._resize_start_geom.left() >= self.minimumWidth():
+                geom.setRight(new_right)
+
+        if top:
+            new_top = self._resize_start_geom.top() + dy
+            if self._resize_start_geom.bottom() - new_top >= self.minimumHeight():
+                geom.setTop(new_top)
+        elif bottom:
+            new_bottom = self._resize_start_geom.bottom() + dy
+            if new_bottom - self._resize_start_geom.top() >= self.minimumHeight():
+                geom.setBottom(new_bottom)
+
+        self.setGeometry(geom)
+        self._update_resize_handles()
+
+    def _end_resize(self):
+        self._resizing = False
+        self._resize_direction = None
+
+
+class TitleBarWidget(QtWidgets.QWidget):
+    """Custom dark title bar with window controls and embedded menu bar."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self._drag_active = False
+        self._drag_offset = QtCore.QPoint()
+
+        self.setFixedHeight(74)
+        self.setObjectName("CustomTitleBar")
+        self.setStyleSheet(
+            "#CustomTitleBar { background-color: #111116; border-bottom: 1px solid #2c2c33; }"
+        )
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 6, 12, 6)
+        main_layout.setSpacing(6)
+
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(10)
+        top_row.setContentsMargins(0, 0, 0, 0)
+
+        self.title_label = QtWidgets.QLabel(window.windowTitle())
+        self.title_label.setStyleSheet("color: #f5f5f7; font-size: 16px; font-weight: 650; letter-spacing: 0.5px;")
+        top_row.addWidget(self.title_label, 1)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(3)
+
+        self.min_btn = self._create_control_button("min", "최소화")
+        self.max_btn = self._create_control_button("max", "최대화")
+        self.close_btn = self._create_control_button("close", "닫기")
+
+        self.min_btn.clicked.connect(window.showMinimized)
+        self.max_btn.clicked.connect(self._toggle_max_restore)
+        self.close_btn.clicked.connect(window.close)
+
+        controls.addWidget(self.min_btn)
+        controls.addWidget(self.max_btn)
+        controls.addWidget(self.close_btn)
+        controls_container = QtWidgets.QWidget()
+        controls_container.setLayout(controls)
+        top_row.addWidget(controls_container, 0)
+        main_layout.addLayout(top_row)
+
+        self.menu_bar = QtWidgets.QMenuBar(self)
+        self.menu_bar.setNativeMenuBar(False)
+        self.menu_bar.setFixedHeight(40)
+        self.menu_bar.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed
+        )
+        self.menu_bar.setStyleSheet(
+            """
+            QMenuBar {
+                background-color: #15151a;
+                color: #f5f5f7;
+                border: 1px solid #2b2b33;
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QMenuBar::item {
+                background-color: transparent;
+                padding: 6px 14px;
+                border-radius: 6px;
+                margin: 0 2px;
+                color: #f5f5f7;
+            }
+            QMenuBar::item:selected {
+                background-color: #2a2a32;
+                color: #ffffff;
+            }
+            QMenuBar::item:pressed {
+                background-color: #3a6ea5;
+                color: #ffffff;
+            }
+            QMenu {
+                background-color: #1f1f23;
+                color: #f5f5f7;
+                border: 1px solid #3c3c44;
+                font-size: 13px;
+            }
+            QMenu::item {
+                padding: 6px 14px;
+                color: #f5f5f7;
+            }
+            QMenu::item:selected {
+                background-color: #3a6ea5;
+                color: #ffffff;
+            }
+            """
+        )
+        main_layout.addWidget(self.menu_bar, 0, QtCore.Qt.AlignLeft)
+
+        window.windowTitleChanged.connect(self.set_title)
+        window.set_state_change_callback(self.update_max_button)
+
+    def _create_control_button(self, role, tooltip):
+        btn = QtWidgets.QToolButton()
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn.setFixedSize(28, 26)
+        btn.setStyleSheet(
+            """
+            QToolButton {
+                background: transparent;
+                border: none;
+                color: #f5f5f7;
+                font: 600 13px 'Segoe UI';
+                padding-bottom: 2px;
+            }
+            QToolButton:hover {
+                color: #ffffff;
+            }
+            QToolButton:pressed {
+                color: #d5d5d5;
+            }
+            """
+        )
+        symbols = {
+            "min": "–",
+            "max": "◻",
+            "close": "✕"
+        }
+        btn.setText(symbols.get(role, role[:1].upper()))
+        btn.setToolTip(tooltip)
+        btn.role = role
+        return btn
+
+    def set_title(self, title):
+        self.title_label.setText(title)
+
+    def _on_interactive_child(self, pos):
+        widget = self.childAt(pos)
+        if not widget:
+            return False
+        interactive_classes = (
+            QtWidgets.QAbstractButton,
+            QtWidgets.QMenuBar,
+            QtWidgets.QMenu,
+        )
+        while widget:
+            if isinstance(widget, interactive_classes):
+                return True
+            widget = widget.parent()
+        return False
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton and not self._on_interactive_child(event.pos()):
+            self._drag_active = True
+            self._drag_offset = event.globalPos() - self.window.frameGeometry().topLeft()
+            event.accept()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_active and event.buttons() & QtCore.Qt.LeftButton:
+            if not self.window.isMaximized():
+                self.window.move(event.globalPos() - self._drag_offset)
+            event.accept()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_active = False
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton and not self._on_interactive_child(event.pos()):
+            self._toggle_max_restore()
+            event.accept()
+        super().mouseDoubleClickEvent(event)
+
+    def _toggle_max_restore(self):
+        if self.window.isMaximized():
+            self.window.showNormal()
+        else:
+            self.window.showMaximized()
+        self.update_max_button()
+
+    def update_max_button(self):
+        if hasattr(self.max_btn, 'role'):
+            self.max_btn.setText("❐" if self.window.isMaximized() else "◻")
+
+
+def apply_dark_theme(app):
+    """Apply a modern dark theme across the entire Qt application."""
+    try:
+        app.setStyle('Fusion')
+    except Exception:
+        pass
+
+    palette = QtGui.QPalette()
+    dark_bg = QtGui.QColor(30, 30, 34)
+    darker_bg = QtGui.QColor(22, 22, 26)
+    text_color = QtGui.QColor(242, 242, 247)
+    highlight = QtGui.QColor(58, 110, 165)
+
+    palette.setColor(QtGui.QPalette.Window, dark_bg)
+    palette.setColor(QtGui.QPalette.WindowText, text_color)
+    palette.setColor(QtGui.QPalette.Base, darker_bg)
+    palette.setColor(QtGui.QPalette.AlternateBase, dark_bg)
+    palette.setColor(QtGui.QPalette.ToolTipBase, text_color)
+    palette.setColor(QtGui.QPalette.ToolTipText, QtGui.QColor(20, 20, 20))
+    palette.setColor(QtGui.QPalette.Text, text_color)
+    palette.setColor(QtGui.QPalette.Button, dark_bg)
+    palette.setColor(QtGui.QPalette.ButtonText, text_color)
+    palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.red)
+    palette.setColor(QtGui.QPalette.Highlight, highlight)
+    palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(255, 255, 255))
+    palette.setColor(QtGui.QPalette.Link, QtGui.QColor(90, 160, 250))
+
+    app.setPalette(palette)
+
+    base_stylesheet = """
+        QMainWindow, QWidget, QDockWidget {
+            background-color: #1f1f23;
+            color: #f5f5f7;
+        }
+        QMenuBar, QMenu {
+            background-color: #1f1f23;
+            color: #f5f5f7;
+        }
+        QMenu::item:selected {
+            background-color: #3a6ea5;
+        }
+        QDockWidget::title {
+            padding: 12px 14px 10px 14px;
+            background-color: #29292f;
+            font-weight: 600;
+            font-size: 14px;
+            min-height: 34px;
+        }
+        QLabel {
+            color: #f5f5f7;
+        }
+        QPushButton {
+            background-color: #2b2b33;
+            color: #f5f5f7;
+            border: 1px solid #3c3c44;
+            border-radius: 6px;
+            padding: 6px 12px;
+        }
+        QPushButton:hover {
+            background-color: #3a3a44;
+        }
+        QPushButton:pressed {
+            background-color: #222228;
+        }
+        QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QTreeWidget, QComboBox, QSpinBox, QTabWidget::pane {
+            background-color: #15151a;
+            color: #f5f5f7;
+            border: 1px solid #3c3c44;
+            border-radius: 6px;
+            selection-background-color: #3a6ea5;
+        }
+        QListWidget::item, QTreeWidget::item {
+            padding: 4px 6px;
+        }
+        QListWidget::item:selected, QTreeWidget::item:selected {
+            background-color: #3a6ea5;
+            color: #ffffff;
+        }
+        QTabWidget::pane {
+            border: 1px solid #3c3c44;
+            margin-top: 2px;
+        }
+        QTabBar::tab {
+            background: #2b2b33;
+            color: #f5f5f7;
+            padding: 6px 12px;
+            border-top-left-radius: 6px;
+            border-top-right-radius: 6px;
+        }
+        QTabBar::tab:selected {
+            background: #3a3a44;
+        }
+        QScrollBar:vertical, QScrollBar:horizontal {
+            background: #1f1f23;
+            border: none;
+            margin: 2px;
+        }
+        QScrollBar::handle {
+            background: #3a3a44;
+            border-radius: 6px;
+        }
+        QScrollBar::handle:hover {
+            background: #4a4a54;
+        }
+        QScrollBar::add-line, QScrollBar::sub-line {
+            background: transparent;
+            border: none;
+        }
+        QToolBar {
+            background-color: #1f1f23;
+            border-bottom: 1px solid #2c2c33;
+        }
+        QGraphicsView {
+            background: #151517;
+            border: none;
+        }
+    """
+
+    existing_stylesheet = app.styleSheet()
+    app.setStyleSheet(base_stylesheet + existing_stylesheet)
+
+
 atexit.register(lambda: shutil.rmtree(attachments_dir, ignore_errors=True))
 
 
-def export_to_json(graph, filename='workflow_export.json'):
-    """
-    그래프를 AI 학습용 JSON 형식으로 내보내기
-    """
+def build_workflow_data(graph):
+    """그래프를 JSON 직렬화 가능한 dict로 변환"""
     workflow_data = {
         "workflow_name": "물류_반송_분석_가이드",
         "description": "전문가 노하우를 구조화한 AI 학습용 워크플로우",
@@ -305,7 +832,16 @@ def export_to_json(graph, filename='workflow_export.json'):
             step['instruction'] = f"결론: {step['conclusion']}"
         
         workflow_data['steps'].append(step)
-    
+
+    return workflow_data
+
+
+def export_to_json(graph, filename='workflow_export.json'):
+    """
+    그래프를 AI 학습용 JSON 형식으로 내보내기
+    """
+    workflow_data = build_workflow_data(graph)
+
     # ZIP 파일로 저장 (JSON + attachments 폴더) - .flow 확장자 사용
     flow_filename = filename
     if not flow_filename.endswith('.flow'):
@@ -331,6 +867,27 @@ def export_to_json(graph, filename='workflow_export.json'):
     print(f"📦 워크플로우 파일에는 JSON과 첨부 파일들이 모두 포함되어 있습니다.")
     
     return workflow_data
+
+
+def export_to_plain_json(graph, filename='workflow_export.json'):
+    """노드 위치를 제외한 JSON을 단독으로 저장"""
+    data = build_workflow_data(graph)
+    plain = {
+        "workflow_name": data.get("workflow_name"),
+        "description": data.get("description"),
+        "steps": []
+    }
+    for step in data.get("steps", []):
+        plain_step = {k: v for k, v in step.items() if k not in {'position', 'node_id'}}
+        plain["steps"].append(plain_step)
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(plain, f, ensure_ascii=False, indent=2)
+        print(f"✅ JSON 내보내기 완료: {filename}")
+        return plain
+    except Exception as e:
+        print(f"❌ JSON 파일 저장 실패: {e}")
+        raise
 
 
 def load_from_json(graph, filename):
@@ -407,7 +964,7 @@ def load_from_json(graph, filename):
             
             # 만약 매핑에 없으면 원본 type 문자열에서 직접 추출 시도 (하위 호환성)
             if not node_type:
-                # 원본 type이 전체 노드 타입 문자열인 경우 (예: "com.samsung.logistics.TableNode")
+                # 원본 type이 전체 노드 타입 문자열인 경우
                 original_type = step.get('type', '')
                 if 'com.samsung.logistics.' in original_type:
                     node_type = original_type
@@ -604,6 +1161,54 @@ def load_from_json(graph, filename):
                     traceback.print_exc()
         
         print(f"✅ 워크플로우 불러오기 완료! ({len(created_nodes)}개 노드, {connection_count}개 연결)")
+        
+        # 워크플로우에서 사용된 항목들 추출
+        used_items = {
+            'tables': set(),
+            'screens': set(),
+            'logs': set(),
+            'situation_types': set()
+        }
+        
+        for step in workflow_data.get('steps', []):
+            step_type = step.get('type', '')
+            
+            # 테이블 추출
+            if step_type == 'table' and 'target_table' in step:
+                table_name = step.get('target_table', '').strip()
+                if table_name:
+                    used_items['tables'].add(table_name)
+            elif step_type == 'observation' and 'table' in step:
+                table_name = step.get('table', '').strip()
+                if table_name:
+                    used_items['tables'].add(table_name)
+            
+            # 화면 추출
+            if step_type == 'screen' and 'screen_name' in step:
+                screen_name = step.get('screen_name', '').strip()
+                if screen_name:
+                    used_items['screens'].add(screen_name)
+            
+            # 로그 추출
+            if step_type == 'log' and 'log_source' in step:
+                log_name = step.get('log_source', '').strip()
+                if log_name:
+                    used_items['logs'].add(log_name)
+            
+            # 상황 유형 추출
+            if step_type == 'trigger' and 'situation_type' in step:
+                situation_type = step.get('situation_type', '').strip()
+                if situation_type:
+                    used_items['situation_types'].add(situation_type)
+        
+        # 사용된 항목들을 딕셔너리에 추가
+        workflow_data['used_items'] = {
+            'tables': list(used_items['tables']),
+            'screens': list(used_items['screens']),
+            'logs': list(used_items['logs']),
+            'situation_types': list(used_items['situation_types'])
+        }
+        
         return workflow_data
         
     except FileNotFoundError:
@@ -621,6 +1226,24 @@ def load_from_json(graph, filename):
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
+    apply_dark_theme(app)
+    app_icon = None
+    try:
+        if APP_ICON_PATH.exists():
+            app_icon = QtGui.QIcon(str(APP_ICON_PATH))
+            app.setWindowIcon(app_icon)
+            print(f"[OK] 앱 아이콘 설정 완료: {APP_ICON_PATH}")
+        else:
+            print(f"[WARNING] 아이콘 파일을 찾을 수 없습니다: {APP_ICON_PATH}")
+    except Exception as e:
+        print(f"[WARNING] 앱 아이콘 설정 실패: {e}")
+    if sys.platform == 'win32':
+        try:
+            from ctypes import windll
+            app_id = u"sdc.logiccanvas.1.0"
+            windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
 
     # 0. attachments 폴더 생성 (파일 첨부용)
     # 1. 메인 그래프 컨트롤러 생성
@@ -667,12 +1290,27 @@ if __name__ == '__main__':
     # 3. 통합 메인 윈도우 생성
     from PySide2.QtWidgets import QMainWindow, QDockWidget, QWidget, QVBoxLayout, QPushButton
     
-    main_window = QMainWindow()
-    main_window.setWindowTitle("Samsung Display - AI 학습용 노하우 구조화 도구")
+    main_window = FramelessMainWindow()
+    main_window.setWindowTitle("암묵지 Flow 구조화 도구")
     main_window.resize(1600, 1000)
+    if 'app_icon' in locals() and app_icon:
+        main_window.setWindowIcon(app_icon)
+    node_dock = None
+    default_dock_state = {'state': QtCore.QByteArray()}
+
+    title_bar_widget = TitleBarWidget(main_window)
+    main_window.setMenuWidget(title_bar_widget)
+    main_window.title_bar = title_bar_widget
     
     # 3-1. 중앙에 그래프 뷰어 배치
     viewer = graph.viewer()
+    try:
+        if hasattr(viewer, 'setStyleSheet'):
+            viewer.setStyleSheet("background-color: #151517; border: none;")
+        if hasattr(viewer, 'view') and viewer.view:
+            viewer.view.setStyleSheet("background-color: #151517; border: none;")
+    except Exception as e:
+        print(f"[WARNING] 뷰어 스타일 적용 실패: {e}")
     main_window.setCentralWidget(viewer)
     
     # 3-2. 좌측에 노드 추가 패널 (Dock Widget)
@@ -695,8 +1333,8 @@ if __name__ == '__main__':
     if not HAS_NODE_TREE:
         node_panel = QWidget()
         node_layout = QVBoxLayout()
-        node_layout.setContentsMargins(10, 5, 10, 10)  # 상단 여백 최소화
-        node_layout.setSpacing(10)
+        node_layout.setContentsMargins(8, 4, 8, 8)  # 상단 여백 최소화
+        node_layout.setSpacing(8)
         node_panel.setLayout(node_layout)
         
         node_types = [
@@ -742,26 +1380,7 @@ if __name__ == '__main__':
                     # 노드 생성 직후 attached_file 속성 보장
                     ensure_attached_file_property(node)
                     
-                    # 노드 생성 직후 숫자 속성을 10으로 설정 (속성이 존재하는 경우에만)
-                    try:
-                        if hasattr(node, 'set_property'):
-                            # 여러 가능한 속성 이름 시도
-                            for prop_name in ['z_value', 'z', 'layer', 'depth']:
-                                try:
-                                    # 속성이 존재하는지 먼저 확인
-                                    if hasattr(node, '_properties') and prop_name in node._properties:
-                                        node.set_property(prop_name, 10)
-                                    elif hasattr(node, 'get_property'):
-                                        # get_property로 존재 여부 확인 (에러가 나지 않으면 존재)
-                                        try:
-                                            node.get_property(prop_name)
-                                            node.set_property(prop_name, 10)
-                                        except:
-                                            pass  # 속성이 없으면 건너뜀
-                                except:
-                                    pass
-                    except:
-                        pass
+                    # 노드 생성 직후 숫자 속성 설정 제거 (NodeGraphQt 내부 속성과 충돌 방지)
                     
                     # 모든 노드의 속성 위젯 가운데 정렬
                     try:
@@ -860,7 +1479,7 @@ if __name__ == '__main__':
         for node_type, node_name, color in node_types:
             btn = QPushButton(node_name)
             btn.setToolTip(f"{node_name} 노드 추가 (클릭하여 추가)")
-            btn.setMinimumHeight(40)
+            btn.setMinimumHeight(34)
             # lambda에서 checked 인자 제거 (QPushButton.clicked는 인자를 전달하지 않음)
             btn.clicked.connect(lambda nt=node_type, nn=node_name: add_node_to_graph_from_button(nt, nn))
             node_layout.addWidget(btn)
@@ -874,10 +1493,6 @@ if __name__ == '__main__':
         data_layout.setContentsMargins(10, 10, 10, 10)
         data_layout.setSpacing(10)
         data_panel.setLayout(data_layout)
-        
-        data_label = QtWidgets.QLabel("📋 항목 관리")
-        data_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 10px;")
-        data_layout.addWidget(data_label)
         
         # 탭 위젯으로 목록 관리 UI 구성
         from PySide2.QtWidgets import QTabWidget
@@ -893,7 +1508,7 @@ if __name__ == '__main__':
         # 테이블 목록을 표시할 리스트 위젯
         from PySide2.QtWidgets import QListWidget, QHBoxLayout
         table_list = QListWidget()
-        table_list.setMaximumHeight(120)
+        table_list.setMaximumHeight(200)
         table_tab_layout.addWidget(table_list)
         
         # 테이블 추가 입력 필드와 버튼 (여러 줄 입력 가능)
@@ -922,7 +1537,16 @@ if __name__ == '__main__':
         def load_tables():
             """JSON 파일에서 테이블 목록 로드"""
             try:
-                with open('tables.json', 'r', encoding='utf-8') as f:
+                # EXE와 같은 폴더를 먼저 확인 (사용자가 수정한 파일 우선)
+                if getattr(sys, 'frozen', False):
+                    json_path = Path.cwd() / 'tables.json'
+                    # EXE와 같은 폴더에 없으면 sys._MEIPASS 확인
+                    if not json_path.exists():
+                        json_path = Path(sys._MEIPASS) / 'tables.json'
+                else:
+                    json_path = Path(__file__).parent / 'tables.json'
+                
+                with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     return data.get('tables', [])
             except FileNotFoundError:
@@ -944,7 +1568,13 @@ if __name__ == '__main__':
                         unique_tables.append(table)
                         seen.add(table)
                 
-                with open('tables.json', 'w', encoding='utf-8') as f:
+                # EXE와 같은 폴더에 저장 (PyInstaller 빌드 시)
+                if getattr(sys, 'frozen', False):
+                    json_path = Path.cwd() / 'tables.json'
+                else:
+                    json_path = Path(__file__).parent / 'tables.json'
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump({'tables': unique_tables}, f, ensure_ascii=False, indent=2)
                 print(f"✅ 테이블 목록 저장 완료: {len(unique_tables)}개 (중복 제거됨)")
                 # 노드의 드롭다운도 업데이트
@@ -990,28 +1620,57 @@ if __name__ == '__main__':
         
         # 노드의 드롭다운 업데이트
         def update_node_tables():
-            """모든 TableNode의 드롭다운 업데이트"""
+            """모든 TableNode와 DataQueryNode의 드롭다운 업데이트"""
             try:
                 tables = load_tables()
-                # 모든 노드를 순회하며 TableNode 찾기
+                updated_count = 0
+                # 모든 노드를 순회하며 TableNode 또는 DataQueryNode 찾기
                 for node in graph.all_nodes():
-                    if hasattr(node, '__class__') and node.__class__.__name__ == 'TableNode':
-                        try:
-                            combo = find_combo_widget(node, 'target_table')
+                    try:
+                        node_type = getattr(node, 'type_', '')
+                        node_name = node.name() if callable(node.name) else (node.name if hasattr(node, 'name') else str(node))
+                        
+                        # TableNode 또는 DataQueryNode 확인
+                        is_table_node = 'TableNode' in node_type or node_type == 'com.samsung.logistics.TableNode'
+                        is_data_query_node = 'DataQueryNode' in node_type or node_type == 'com.samsung.logistics.DataQueryNode'
+                        
+                        if is_table_node or is_data_query_node:
+                            prop_name = 'target_table'
+                            
+                            # 방법 1: 위젯 찾아서 업데이트
+                            combo = find_combo_widget(node, prop_name)
                             if combo:
                                 current_value = combo.currentText()
                                 combo.clear()
                                 combo.addItems(tables)
-                                # 기존 값이 목록에 있으면 유지, 없으면 첫 번째 항목으로
                                 if current_value in tables:
                                     combo.setCurrentText(current_value)
                                 elif tables:
                                     combo.setCurrentText(tables[0])
-                                print(f"  ✅ TableNode '{node.name()}'의 드롭다운 업데이트 완료")
-                        except Exception as e:
-                            print(f"  ⚠️ 노드 '{node.name()}' 업데이트 실패: {e}")
+                                updated_count += 1
+                                print(f"  ✅ {node_name}의 드롭다운 업데이트 완료 (위젯)")
+                            else:
+                                # 방법 2: 위젯을 찾지 못하면 속성 직접 업데이트 시도
+                                try:
+                                    # 노드의 속성 모델에 직접 접근
+                                    if hasattr(node, 'model') and hasattr(node.model, 'set_property'):
+                                        # 속성의 items 업데이트 시도
+                                        current_value = node.get_property(prop_name) if hasattr(node, 'get_property') else ''
+                                        # 노드를 다시 생성하는 대신, 속성 위젯을 강제로 새로고침
+                                        # NodeGraphQt의 경우 속성 위젯이 자동으로 업데이트되지 않을 수 있음
+                                        print(f"  ⚠️ {node_name}의 위젯을 찾을 수 없어 속성만 업데이트")
+                                except Exception as e2:
+                                    print(f"  ⚠️ {node_name} 업데이트 실패: {e2}")
+                    except Exception as e:
+                        node_name = str(node) if hasattr(node, '__str__') else 'Unknown'
+                        print(f"  ⚠️ 노드 '{node_name}' 업데이트 실패: {e}")
+                
+                if updated_count > 0:
+                    print(f"✅ {updated_count}개 노드의 테이블 드롭다운이 업데이트되었습니다.")
             except Exception as e:
                 print(f"⚠️ 노드 테이블 목록 업데이트 실패: {e}")
+                import traceback
+                traceback.print_exc()
         
         # 테이블 추가 함수 (여러 개 한 번에 추가 가능)
         def add_table():
@@ -1060,7 +1719,7 @@ if __name__ == '__main__':
                         skipped_count += 1
                 
                 # 입력 처리 완료 후 항상 입력 필드 비우기
-                table_input.clear()
+                    table_input.clear()
                 
                 # 항상 JSON 파일에 저장 (중복 제거된 목록으로)
                 all_items = [table_list.item(i).text() for i in range(table_list.count())]
@@ -1130,7 +1789,7 @@ if __name__ == '__main__':
         
         # 상황 유형 목록을 표시할 리스트 위젯
         situation_list = QListWidget()
-        situation_list.setMaximumHeight(120)
+        situation_list.setMaximumHeight(200)
         situation_tab_layout.addWidget(situation_list)
         
         # 상황 유형 추가 입력 필드와 버튼 (여러 줄 입력 가능)
@@ -1161,7 +1820,7 @@ if __name__ == '__main__':
         screen_tab.setLayout(screen_tab_layout)
         
         screen_list = QListWidget()
-        screen_list.setMaximumHeight(120)
+        screen_list.setMaximumHeight(200)
         screen_tab_layout.addWidget(screen_list)
         
         screen_input_layout = QHBoxLayout()
@@ -1190,7 +1849,7 @@ if __name__ == '__main__':
         log_tab.setLayout(log_tab_layout)
         
         log_list = QListWidget()
-        log_list.setMaximumHeight(120)
+        log_list.setMaximumHeight(200)
         log_tab_layout.addWidget(log_list)
         
         log_input_layout = QHBoxLayout()
@@ -1224,7 +1883,16 @@ if __name__ == '__main__':
         def load_situation_types():
             """JSON 파일에서 상황 유형 목록 로드"""
             try:
-                with open('situation_types.json', 'r', encoding='utf-8') as f:
+                # EXE와 같은 폴더를 먼저 확인 (사용자가 수정한 파일 우선)
+                if getattr(sys, 'frozen', False):
+                    json_path = Path.cwd() / 'situation_types.json'
+                    # EXE와 같은 폴더에 없으면 sys._MEIPASS 확인
+                    if not json_path.exists():
+                        json_path = Path(sys._MEIPASS) / 'situation_types.json'
+                else:
+                    json_path = Path(__file__).parent / 'situation_types.json'
+                
+                with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     return data.get('situation_types', [])
             except FileNotFoundError:
@@ -1238,7 +1906,13 @@ if __name__ == '__main__':
         def save_situation_types(types_list):
             """JSON 파일에 상황 유형 목록 저장"""
             try:
-                with open('situation_types.json', 'w', encoding='utf-8') as f:
+                # EXE와 같은 폴더에 저장 (PyInstaller 빌드 시)
+                if getattr(sys, 'frozen', False):
+                    json_path = Path.cwd() / 'situation_types.json'
+                else:
+                    json_path = Path(__file__).parent / 'situation_types.json'
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump({'situation_types': types_list}, f, ensure_ascii=False, indent=2)
                 print(f"✅ 상황 유형 목록 저장 완료: {len(types_list)}개")
                 # 노드의 드롭다운도 업데이트
@@ -1251,10 +1925,17 @@ if __name__ == '__main__':
             """모든 TriggerNode의 드롭다운 업데이트"""
             try:
                 types = load_situation_types()
+                updated_count = 0
                 # 모든 노드를 순회하며 TriggerNode 찾기
                 for node in graph.all_nodes():
-                    if hasattr(node, '__class__') and node.__class__.__name__ == 'TriggerNode':
-                        try:
+                    try:
+                        node_type = getattr(node, 'type_', '')
+                        node_name = node.name() if callable(node.name) else (node.name if hasattr(node, 'name') else str(node))
+                        
+                        # TriggerNode 확인
+                        is_trigger_node = 'TriggerNode' in node_type or node_type == 'com.samsung.logistics.TriggerNode'
+                        
+                        if is_trigger_node:
                             combo = find_combo_widget(node, 'situation_type')
                             if combo:
                                 current_value = combo.currentText()
@@ -1264,17 +1945,33 @@ if __name__ == '__main__':
                                     combo.setCurrentText(current_value)
                                 elif types:
                                     combo.setCurrentText(types[0])
-                                print(f"  ✅ TriggerNode '{node.name()}'의 드롭다운 업데이트 완료")
-                        except Exception as e:
-                            print(f"  ⚠️ 노드 '{node.name()}' 업데이트 실패: {e}")
+                                updated_count += 1
+                                print(f"  ✅ {node_name}의 드롭다운 업데이트 완료")
+                    except Exception as e:
+                        node_name = str(node) if hasattr(node, '__str__') else 'Unknown'
+                        print(f"  ⚠️ 노드 '{node_name}' 업데이트 실패: {e}")
+                
+                if updated_count > 0:
+                    print(f"✅ {updated_count}개 노드의 상황 유형 드롭다운이 업데이트되었습니다.")
             except Exception as e:
                 print(f"⚠️ 노드 상황 유형 목록 업데이트 실패: {e}")
+                import traceback
+                traceback.print_exc()
         
         # 화면 목록 관리 함수들
         def load_screens():
             """JSON 파일에서 화면 목록 로드"""
             try:
-                with open('screens.json', 'r', encoding='utf-8') as f:
+                # EXE와 같은 폴더를 먼저 확인 (사용자가 수정한 파일 우선)
+                if getattr(sys, 'frozen', False):
+                    json_path = Path.cwd() / 'screens.json'
+                    # EXE와 같은 폴더에 없으면 sys._MEIPASS 확인
+                    if not json_path.exists():
+                        json_path = Path(sys._MEIPASS) / 'screens.json'
+                else:
+                    json_path = Path(__file__).parent / 'screens.json'
+                
+                with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     return data.get('screens', [])
             except FileNotFoundError:
@@ -1286,7 +1983,13 @@ if __name__ == '__main__':
         def save_screens(screens_list):
             """JSON 파일에 화면 목록 저장"""
             try:
-                with open('screens.json', 'w', encoding='utf-8') as f:
+                # EXE와 같은 폴더에 저장 (PyInstaller 빌드 시)
+                if getattr(sys, 'frozen', False):
+                    json_path = Path.cwd() / 'screens.json'
+                else:
+                    json_path = Path(__file__).parent / 'screens.json'
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump({'screens': screens_list}, f, ensure_ascii=False, indent=2)
                 print(f"✅ 화면 목록 저장 완료: {len(screens_list)}개")
                 update_node_screens()
@@ -1297,9 +2000,16 @@ if __name__ == '__main__':
             """모든 ScreenNode의 드롭다운 업데이트"""
             try:
                 screens = load_screens()
+                updated_count = 0
                 for node in graph.all_nodes():
-                    if hasattr(node, '__class__') and node.__class__.__name__ == 'ScreenNode':
-                        try:
+                    try:
+                        node_type = getattr(node, 'type_', '')
+                        node_name = node.name() if callable(node.name) else (node.name if hasattr(node, 'name') else str(node))
+                        
+                        # ScreenNode 확인
+                        is_screen_node = 'ScreenNode' in node_type or node_type == 'com.samsung.logistics.ScreenNode'
+                        
+                        if is_screen_node:
                             combo = find_combo_widget(node, 'screen_name')
                             if combo:
                                 current_value = combo.currentText()
@@ -1309,11 +2019,18 @@ if __name__ == '__main__':
                                     combo.setCurrentText(current_value)
                                 elif screens:
                                     combo.setCurrentText(screens[0])
-                                print(f"  ✅ ScreenNode '{node.name()}'의 드롭다운 업데이트 완료")
-                        except Exception as e:
-                            print(f"  ⚠️ 노드 '{node.name()}' 업데이트 실패: {e}")
+                                updated_count += 1
+                                print(f"  ✅ {node_name}의 드롭다운 업데이트 완료")
+                    except Exception as e:
+                        node_name = str(node) if hasattr(node, '__str__') else 'Unknown'
+                        print(f"  ⚠️ 노드 '{node_name}' 업데이트 실패: {e}")
+                
+                if updated_count > 0:
+                    print(f"✅ {updated_count}개 노드의 화면 드롭다운이 업데이트되었습니다.")
             except Exception as e:
                 print(f"⚠️ 노드 화면 목록 업데이트 실패: {e}")
+                import traceback
+                traceback.print_exc()
         
         def add_screen():
             """화면 목록에 새 항목 추가 (중복 자동 제거)"""
@@ -1350,7 +2067,7 @@ if __name__ == '__main__':
                         skipped_count += 1
                 
                 # 입력 처리 완료 후 항상 입력 필드 비우기
-                screen_input.clear()
+                    screen_input.clear()
                 
                 if added_count > 0:
                     # JSON 파일에 저장 (중복 제거된 목록으로)
@@ -1378,7 +2095,16 @@ if __name__ == '__main__':
         def load_logs():
             """JSON 파일에서 로그 목록 로드"""
             try:
-                with open('logs.json', 'r', encoding='utf-8') as f:
+                # EXE와 같은 폴더를 먼저 확인 (사용자가 수정한 파일 우선)
+                if getattr(sys, 'frozen', False):
+                    json_path = Path.cwd() / 'logs.json'
+                    # EXE와 같은 폴더에 없으면 sys._MEIPASS 확인
+                    if not json_path.exists():
+                        json_path = Path(sys._MEIPASS) / 'logs.json'
+                else:
+                    json_path = Path(__file__).parent / 'logs.json'
+                
+                with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     return data.get('logs', [])
             except FileNotFoundError:
@@ -1390,7 +2116,13 @@ if __name__ == '__main__':
         def save_logs(logs_list):
             """JSON 파일에 로그 목록 저장"""
             try:
-                with open('logs.json', 'w', encoding='utf-8') as f:
+                # EXE와 같은 폴더에 저장 (PyInstaller 빌드 시)
+                if getattr(sys, 'frozen', False):
+                    json_path = Path.cwd() / 'logs.json'
+                else:
+                    json_path = Path(__file__).parent / 'logs.json'
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump({'logs': logs_list}, f, ensure_ascii=False, indent=2)
                 print(f"✅ 로그 목록 저장 완료: {len(logs_list)}개")
                 update_node_logs()
@@ -1401,9 +2133,16 @@ if __name__ == '__main__':
             """모든 LogNode의 드롭다운 업데이트"""
             try:
                 logs = load_logs()
+                updated_count = 0
                 for node in graph.all_nodes():
-                    if hasattr(node, '__class__') and node.__class__.__name__ == 'LogNode':
-                        try:
+                    try:
+                        node_type = getattr(node, 'type_', '')
+                        node_name = node.name() if callable(node.name) else (node.name if hasattr(node, 'name') else str(node))
+                        
+                        # LogNode 확인
+                        is_log_node = 'LogNode' in node_type or node_type == 'com.samsung.logistics.LogNode'
+                        
+                        if is_log_node:
                             combo = find_combo_widget(node, 'log_source')
                             if combo:
                                 current_value = combo.currentText()
@@ -1413,11 +2152,18 @@ if __name__ == '__main__':
                                     combo.setCurrentText(current_value)
                                 elif logs:
                                     combo.setCurrentText(logs[0])
-                                print(f"  ✅ LogNode '{node.name()}'의 드롭다운 업데이트 완료")
-                        except Exception as e:
-                            print(f"  ⚠️ 노드 '{node.name()}' 업데이트 실패: {e}")
+                                updated_count += 1
+                                print(f"  ✅ {node_name}의 드롭다운 업데이트 완료")
+                    except Exception as e:
+                        node_name = str(node) if hasattr(node, '__str__') else 'Unknown'
+                        print(f"  ⚠️ 노드 '{node_name}' 업데이트 실패: {e}")
+                
+                if updated_count > 0:
+                    print(f"✅ {updated_count}개 노드의 로그 드롭다운이 업데이트되었습니다.")
             except Exception as e:
                 print(f"⚠️ 노드 로그 목록 업데이트 실패: {e}")
+                import traceback
+                traceback.print_exc()
         
         def add_log():
             """로그 목록에 새 항목 추가 (중복 자동 제거)"""
@@ -1454,7 +2200,7 @@ if __name__ == '__main__':
                         skipped_count += 1
                 
                 # 입력 처리 완료 후 항상 입력 필드 비우기
-                log_input.clear()
+                    log_input.clear()
                 
                 if added_count > 0:
                     # JSON 파일에 저장 (중복 제거된 목록으로)
@@ -1516,7 +2262,7 @@ if __name__ == '__main__':
                         skipped_count += 1
                 
                 # 입력 처리 완료 후 항상 입력 필드 비우기
-                situation_input.clear()
+                    situation_input.clear()
                 
                 if added_count > 0:
                     # JSON 파일에 저장 (중복 제거된 목록으로)
@@ -1542,22 +2288,7 @@ if __name__ == '__main__':
                 # JSON 파일에 저장
                 save_situation_types([situation_list.item(i).text() for i in range(situation_list.count())])
         
-        # 초기 목록 로드 (중복 제거)
-        tables = load_tables()
-        # 중복 제거
-        seen = set()
-        unique_tables = []
-        for table in tables:
-            if table not in seen:
-                unique_tables.append(table)
-                seen.add(table)
-        # 중복 제거된 목록으로 저장
-        if len(unique_tables) != len(tables):
-            save_tables(unique_tables)
-            print(f"✅ 테이블 목록에서 중복 {len(tables) - len(unique_tables)}개 제거됨")
-        for table in unique_tables:
-            table_list.addItem(table)
-        
+        # 초기 상황 유형 목록 로드 (중복 제거)
         situation_types = load_situation_types()
         # 중복 제거
         seen = set()
@@ -1659,14 +2390,9 @@ if __name__ == '__main__':
     # 3-3. 파일 첨부 패널 (별도 Dock Widget)
     file_attachment_panel = QWidget()
     file_attachment_layout = QVBoxLayout()
-    file_attachment_layout.setContentsMargins(10, 10, 10, 10)
-    file_attachment_layout.setSpacing(10)
+    file_attachment_layout.setContentsMargins(8, 8, 8, 8)
+    file_attachment_layout.setSpacing(8)
     file_attachment_panel.setLayout(file_attachment_layout)
-    
-    # 제목
-    file_label = QtWidgets.QLabel("📎 파일 첨부")
-    file_label.setStyleSheet("font-weight: bold; font-size: 16px; padding: 12px;")
-    file_attachment_layout.addWidget(file_label)
     
     # 선택된 노드 표시
     selected_node_label = QtWidgets.QLabel("선택된 노드: 없음")
@@ -1675,7 +2401,7 @@ if __name__ == '__main__':
     
     # 파일 선택 버튼
     file_select_btn = QPushButton("📁 파일 선택")
-    file_select_btn.setMinimumHeight(40)
+    file_select_btn.setMinimumHeight(34)
     file_select_btn.setStyleSheet("font-size: 13px; font-weight: bold;")
     file_attachment_layout.addWidget(file_select_btn)
     
@@ -1687,14 +2413,14 @@ if __name__ == '__main__':
     
     # 파일 열기 버튼
     open_file_btn = QPushButton("📂 파일 열기")
-    open_file_btn.setMinimumHeight(36)
+    open_file_btn.setMinimumHeight(32)
     open_file_btn.setStyleSheet("font-size: 13px;")
     open_file_btn.setEnabled(False)
     file_attachment_layout.addWidget(open_file_btn)
     
     # 파일 삭제 버튼
     file_delete_btn = QPushButton("🗑️ 파일 삭제")
-    file_delete_btn.setMinimumHeight(36)
+    file_delete_btn.setMinimumHeight(32)
     file_delete_btn.setStyleSheet("font-size: 13px;")
     file_delete_btn.setEnabled(False)  # 파일이 없으면 비활성화
     file_attachment_layout.addWidget(file_delete_btn)
@@ -1848,8 +2574,8 @@ if __name__ == '__main__':
     file_attachment_dock.setWidget(file_attachment_panel)
     file_attachment_dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
     main_window.addDockWidget(QtCore.Qt.LeftDockWidgetArea, file_attachment_dock)
-    file_attachment_dock.setMinimumWidth(350)
-    file_attachment_dock.setMinimumHeight(300)
+    file_attachment_dock.setMinimumWidth(320)
+    file_attachment_dock.setMinimumHeight(250)
     print("✅ 파일 첨부 패널 추가 완료 (좌측 상단)")
 
     # 파일 첨부 패널 아래에 노드/데이터 패널 정렬
@@ -1868,7 +2594,8 @@ if __name__ == '__main__':
         node_dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
         main_window.addDockWidget(QtCore.Qt.LeftDockWidgetArea, node_dock)
         main_window.splitDockWidget(dock_anchor, node_dock, QtCore.Qt.Vertical)
-        node_dock.setMinimumWidth(200)
+        node_dock.setMinimumWidth(220)
+        node_dock.setMinimumHeight(240)
         dock_anchor = node_dock
         print("✅ 노드 추가 버튼 패널 추가 완료 (좌측 중간)")
 
@@ -1877,9 +2604,125 @@ if __name__ == '__main__':
     data_dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
     main_window.addDockWidget(QtCore.Qt.LeftDockWidgetArea, data_dock)
     main_window.splitDockWidget(dock_anchor, data_dock, QtCore.Qt.Vertical)
-    data_dock.setMinimumWidth(300)
-    data_dock.setMinimumHeight(400)
+    data_dock.setMinimumWidth(320)
+    data_dock.setMinimumHeight(500)
     print("✅ 항목 관리 패널 추가 완료 (좌측 하단)")
+    try:
+        default_dock_state['state'] = QtCore.QByteArray(main_window.saveState())
+        print("✅ 기본 패널 레이아웃 저장 완료")
+    except Exception as e:
+        print(f"⚠️ 기본 패널 레이아웃 저장 실패: {e}")
+
+    def get_graph_view():
+        """그래프 뷰를 찾아 반환"""
+        try:
+            viewer_obj = graph.viewer()
+        except Exception as err:
+            print(f"⚠️ viewer 접근 실패: {err}")
+            return None
+        if not viewer_obj:
+            return None
+
+        candidates = []
+        for attr in ('view', 'get_view'):
+            try:
+                if hasattr(viewer_obj, attr):
+                    candidate = getattr(viewer_obj, attr)
+                    if callable(candidate):
+                        candidate = candidate()
+                    candidates.append(candidate)
+            except Exception:
+                pass
+
+        if isinstance(viewer_obj, QtWidgets.QGraphicsView):
+            candidates.append(viewer_obj)
+        try:
+            candidates.extend(viewer_obj.findChildren(QtWidgets.QGraphicsView))
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            if isinstance(candidate, QtWidgets.QGraphicsView):
+                return candidate
+
+        for obj in (viewer_obj, graph):
+            try:
+                scene = obj.scene() if hasattr(obj, 'scene') else None
+                if scene and hasattr(scene, 'views'):
+                    views = scene.views()
+                    if views:
+                        return views[0]
+            except Exception:
+                continue
+        return None
+
+    def reset_panel_layout():
+        """모든 Dock 패널을 기본 배치로 복원"""
+        state = default_dock_state.get('state')
+        if state and not state.isEmpty():
+            try:
+                main_window.restoreState(state)
+                file_attachment_dock.show()
+                if node_dock:
+                    node_dock.show()
+                data_dock.show()
+                QtCore.QTimer.singleShot(150, update_file_attachment_panel)
+                print("✅ 패널 레이아웃이 기본 상태로 복원되었습니다.")
+            except Exception as err:
+                print(f"⚠️ 패널 레이아웃 복원 실패: {err}")
+        else:
+            print("⚠️ 저장된 기본 패널 레이아웃이 없어 복원할 수 없습니다.")
+
+    def show_about_dialog():
+        """프로그램 정보 다이얼로그 표시"""
+        about = QtWidgets.QMessageBox(main_window)
+        about.setWindowTitle("프로그램 정보")
+        about.setIcon(QtWidgets.QMessageBox.Information)
+        text = (
+            "<b>Samsung Display - AI 학습용 노하우 구조화 도구</b><br>"
+            "전문가의 분석 과정을 노드 기반으로 기록하고 공유할 수 있는 도구입니다."
+        )
+        about.setText(text)
+        about.setInformativeText(
+            "버전: 1.0.0\n"
+            "개발: LogicCanvas 팀 (2025)\n"
+            "파일 저장: .flow (JSON + 첨부 파일)"
+        )
+        if APP_ICON_PATH.exists():
+            try:
+                pixmap = QtGui.QPixmap(str(APP_ICON_PATH)).scaled(
+                    96, 96, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+                )
+                about.setIconPixmap(pixmap)
+            except Exception as err:
+                print(f"⚠️ 도움말 아이콘 로드 실패: {err}")
+        about.exec_()
+
+    def on_export_plain_json(exporter):
+        """위치 정보를 제외하고 JSON으로 저장"""
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            main_window,
+            "JSON 내보내기",
+            "workflow_export.json",
+            "JSON 파일 (*.json);;모든 파일 (*.*)"
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith('.json'):
+            filename += '.json'
+        try:
+            result = exporter(graph, filename)
+            QtWidgets.QMessageBox.information(
+                main_window,
+                "내보내기 완료 ✅",
+                f"JSON이 성공적으로 저장되었습니다!\n\n파일: {filename}\n노드 수: {len(result.get('steps', []))}개\n(노드 위치 정보는 제외되었습니다.)"
+            )
+        except Exception as err:
+            QtWidgets.QMessageBox.critical(
+                main_window,
+                "내보내기 실패",
+                f"JSON 저장 중 오류가 발생했습니다:\n{err}"
+            )
     
     # 노드 선택/해제 시 파일 첨부 패널 업데이트
     try:
@@ -1899,21 +2742,11 @@ if __name__ == '__main__':
     
     # QGraphicsScene의 selectionChanged 시그널 사용 (가장 확실한 방법)
     try:
-        viewer = graph.viewer()
-        if viewer:
-            view = None
-            if hasattr(viewer, 'view'):
-                view = viewer.view
-            elif hasattr(viewer, 'get_view'):
-                view = viewer.get_view()
-            elif isinstance(viewer, QtWidgets.QGraphicsView):
-                view = viewer
-            
-            if view and view.scene():
-                scene = view.scene()
-                # selectionChanged 시그널 연결
-                scene.selectionChanged.connect(lambda: QtCore.QTimer.singleShot(50, update_file_attachment_panel))
-                print("✅ Scene selectionChanged 이벤트 연결 완료")
+        view = get_graph_view()
+        if view and view.scene():
+            scene = view.scene()
+            scene.selectionChanged.connect(lambda: QtCore.QTimer.singleShot(50, update_file_attachment_panel))
+            print("✅ Scene selectionChanged 이벤트 연결 완료")
     except Exception as e:
         print(f"⚠️ Scene selectionChanged 이벤트 연결 실패: {e}")
     
@@ -1925,29 +2758,16 @@ if __name__ == '__main__':
     
     # 캔버스 클릭 시 선택 해제 감지 (추가 보완)
     try:
-        viewer = graph.viewer()
-        if viewer:
-            view = None
-            if hasattr(viewer, 'view'):
-                view = viewer.view
-            elif hasattr(viewer, 'get_view'):
-                view = viewer.get_view()
-            elif isinstance(viewer, QtWidgets.QGraphicsView):
-                view = viewer
-            
-            if view:
-                original_mouse_press = view.mousePressEvent
-                
-                def custom_mouse_press(event):
-                    """커스텀 마우스 클릭 이벤트 핸들러"""
-                    # 원래 이벤트 처리
-                    original_mouse_press(event)
-                    
-                    # 약간의 지연 후 패널 업데이트 (선택 상태가 변경된 후)
-                    QtCore.QTimer.singleShot(100, update_file_attachment_panel)
-                
-                view.mousePressEvent = custom_mouse_press
-                print("✅ 캔버스 클릭 이벤트 연결 완료")
+        view = get_graph_view()
+        if view:
+            original_mouse_press = view.mousePressEvent
+
+            def custom_mouse_press(event):
+                original_mouse_press(event)
+                QtCore.QTimer.singleShot(100, update_file_attachment_panel)
+
+            view.mousePressEvent = custom_mouse_press
+            print("✅ 캔버스 클릭 이벤트 연결 완료")
     except Exception as e:
         print(f"⚠️ 캔버스 클릭 이벤트 연결 실패: {e}")
     
@@ -1969,83 +2789,10 @@ if __name__ == '__main__':
             if not nodes:
                 print("⚠️ 표시할 노드가 없습니다.")
                 return
-            
-            # viewer의 view 가져오기 (여러 방법 시도)
-            view = None
-            
-            # 방법 1: viewer.view 속성
-            try:
-                if hasattr(viewer, 'view'):
-                    view = viewer.view
-            except:
-                pass
-            
-            # 방법 2: viewer의 자식 위젯 중 QGraphicsView 찾기
+
+            view = get_graph_view()
             if not view:
-                try:
-                    if hasattr(viewer, 'findChildren'):
-                        children = viewer.findChildren(QtWidgets.QGraphicsView)
-                        if children:
-                            view = children[0]
-                except:
-                    pass
-            
-            # 방법 3: viewer 자체가 QGraphicsView인 경우
-            if not view:
-                try:
-                    if isinstance(viewer, QtWidgets.QGraphicsView):
-                        view = viewer
-                except:
-                    pass
-            
-            # 방법 4: graph.viewer()를 통해 다시 가져오기
-            if not view:
-                try:
-                    temp_viewer = graph.viewer()
-                    if hasattr(temp_viewer, 'view'):
-                        view = temp_viewer.view
-                    elif isinstance(temp_viewer, QtWidgets.QGraphicsView):
-                        view = temp_viewer
-                    elif hasattr(temp_viewer, 'findChildren'):
-                        children = temp_viewer.findChildren(QtWidgets.QGraphicsView)
-                        if children:
-                            view = children[0]
-                except Exception as e:
-                    print(f"  ⚠️ graph.viewer() 시도 실패: {e}")
-            
-            # 방법 5: viewer.scene()을 통해 접근
-            if not view:
-                try:
-                    if hasattr(viewer, 'scene'):
-                        scene = viewer.scene()
-                        if scene and hasattr(scene, 'views'):
-                            views = scene.views()
-                            if views:
-                                view = views[0]
-                except Exception as e:
-                    print(f"  ⚠️ viewer.scene() 접근 실패: {e}")
-            
-            # 방법 6: graph.scene()을 통해 접근
-            if not view:
-                try:
-                    if hasattr(graph, 'scene'):
-                        scene = graph.scene()
-                        if scene and hasattr(scene, 'views'):
-                            views = scene.views()
-                            if views:
-                                view = views[0]
-                except Exception as e:
-                    print(f"  ⚠️ graph.scene() 접근 실패: {e}")
-            
-            if not view:
-                print(f"⚠️ 뷰를 찾을 수 없습니다. (viewer 타입: {type(viewer)})")
-                # 디버깅 정보 출력
-                try:
-                    print(f"  viewer 속성: {dir(viewer)}")
-                    if hasattr(viewer, 'view'):
-                        print(f"  viewer.view: {viewer.view}")
-                except:
-                    pass
+                print("⚠️ 뷰를 찾을 수 없습니다.")
                 return
             
             # 모든 노드의 위치 수집
@@ -2562,7 +3309,7 @@ if __name__ == '__main__':
                 
                 # 새로 추가된 노드가 화면 중앙에 오도록 캔버스 이동
                 try:
-                    view = viewer.view
+                    view = get_graph_view()
                     if view:
                         # 방법 1: centerOn 시도
                         try:
@@ -2678,7 +3425,7 @@ if __name__ == '__main__':
                 return menu
             
             # 그래프 뷰어에 context menu 이벤트 연결
-            view = viewer.view
+            view = get_graph_view()
             if view:
                 def on_context_menu(pos):
                     """우클릭 시 호출되는 함수"""
@@ -2712,7 +3459,7 @@ if __name__ == '__main__':
         from PySide2.QtGui import QMouseEvent
         
         # 뷰어의 view에 접근
-        view = viewer.view
+        view = get_graph_view()
         if not view:
             print("⚠️ 뷰어의 view를 찾을 수 없습니다")
         else:
@@ -3032,14 +3779,224 @@ if __name__ == '__main__':
             if filename:
                 print(f"\n📂 워크플로우 파일 열기 시작: {filename}")
                 try:
+                    # 먼저 워크플로우 데이터를 읽어서 사용된 항목들을 추출
+                    workflow_data = None
+                    try:
+                        clear_attachments_dir()
+                        # ZIP 파일인지 확인 (.flow 또는 .zip)
+                        if filename.endswith('.flow') or filename.endswith('.zip'):
+                            with zipfile.ZipFile(filename, 'r') as zipf:
+                                if 'workflow.json' in zipf.namelist():
+                                    json_content = zipf.read('workflow.json').decode('utf-8')
+                                    workflow_data = json.loads(json_content)
+                                else:
+                                    json_files = [f for f in zipf.namelist() if f.endswith('.json')]
+                                    if json_files:
+                                        json_content = zipf.read(json_files[0]).decode('utf-8')
+                                        workflow_data = json.loads(json_content)
+                        else:
+                            with open(filename, 'r', encoding='utf-8') as f:
+                                workflow_data = json.load(f)
+                    except Exception as e:
+                        print(f"⚠️ 워크플로우 데이터 읽기 실패: {e}")
+                        workflow_data = None
+                    
+                    # 워크플로우에서 사용된 항목들을 먼저 추출하고 목록에 추가 (노드 로드 전에!)
+                    used_items = {
+                        'tables': set(),
+                        'screens': set(),
+                        'logs': set(),
+                        'situation_types': set()
+                    }
+                    
+                    if workflow_data:
+                        for step in workflow_data.get('steps', []):
+                            step_type = step.get('type', '')
+                            
+                            # 테이블 추출
+                            if step_type == 'table' and 'target_table' in step:
+                                table_name = step.get('target_table', '').strip()
+                                if table_name:
+                                    used_items['tables'].add(table_name)
+                            elif step_type == 'observation' and 'table' in step:
+                                table_name = step.get('table', '').strip()
+                                if table_name:
+                                    used_items['tables'].add(table_name)
+                            
+                            # 화면 추출
+                            if step_type == 'screen' and 'screen_name' in step:
+                                screen_name = step.get('screen_name', '').strip()
+                                if screen_name:
+                                    used_items['screens'].add(screen_name)
+                            
+                            # 로그 추출
+                            if step_type == 'log' and 'log_source' in step:
+                                log_name = step.get('log_source', '').strip()
+                                if log_name:
+                                    used_items['logs'].add(log_name)
+                            
+                            # 상황 유형 추출
+                            if step_type == 'trigger' and 'situation_type' in step:
+                                situation_type = step.get('situation_type', '').strip()
+                                if situation_type:
+                                    used_items['situation_types'].add(situation_type)
+                    
+                    # 사용된 항목들을 목록에 먼저 추가 (노드 로드 전에!)
+                    added_count = {'tables': 0, 'screens': 0, 'logs': 0, 'situation_types': 0}
+                    
+                    # 테이블 추가
+                    if used_items.get('tables'):
+                        current_tables = [table_list.item(i).text() for i in range(table_list.count())]
+                        for table in used_items['tables']:
+                            if table and table not in current_tables:
+                                table_list.addItem(table)
+                                current_tables.append(table)
+                                added_count['tables'] += 1
+                        if added_count['tables'] > 0:
+                            all_tables = [table_list.item(i).text() for i in range(table_list.count())]
+                            save_tables(all_tables)
+                            print(f"✅ {added_count['tables']}개 테이블이 목록에 추가되었습니다 (노드 로드 전).")
+                    
+                    # 화면 추가
+                    if used_items.get('screens'):
+                        current_screens = [screen_list.item(i).text() for i in range(screen_list.count())]
+                        for screen in used_items['screens']:
+                            if screen and screen not in current_screens:
+                                screen_list.addItem(screen)
+                                current_screens.append(screen)
+                                added_count['screens'] += 1
+                        if added_count['screens'] > 0:
+                            all_screens = [screen_list.item(i).text() for i in range(screen_list.count())]
+                            save_screens(all_screens)
+                            print(f"✅ {added_count['screens']}개 화면이 목록에 추가되었습니다 (노드 로드 전).")
+                    
+                    # 로그 추가
+                    if used_items.get('logs'):
+                        current_logs = [log_list.item(i).text() for i in range(log_list.count())]
+                        for log in used_items['logs']:
+                            if log and log not in current_logs:
+                                log_list.addItem(log)
+                                current_logs.append(log)
+                                added_count['logs'] += 1
+                        if added_count['logs'] > 0:
+                            all_logs = [log_list.item(i).text() for i in range(log_list.count())]
+                            save_logs(all_logs)
+                            print(f"✅ {added_count['logs']}개 로그가 목록에 추가되었습니다 (노드 로드 전).")
+                    
+                    # 상황 유형 추가
+                    if used_items.get('situation_types'):
+                        current_situation_types = [situation_list.item(i).text() for i in range(situation_list.count())]
+                        for stype in used_items['situation_types']:
+                            if stype and stype not in current_situation_types:
+                                situation_list.addItem(stype)
+                                current_situation_types.append(stype)
+                                added_count['situation_types'] += 1
+                        if added_count['situation_types'] > 0:
+                            all_situation_types = [situation_list.item(i).text() for i in range(situation_list.count())]
+                            save_situation_types(all_situation_types)
+                            print(f"✅ {added_count['situation_types']}개 상황 유형이 목록에 추가되었습니다 (노드 로드 전).")
+                    
+                    # 이제 노드 로드 (목록에 항목이 이미 추가된 상태)
                     result = load_from_json(graph, filename)
                     if result:
                         file_type = "워크플로우 파일" if filename.endswith('.flow') else ("ZIP 파일" if filename.endswith('.zip') else "JSON 파일")
                         update_file_attachment_panel()
+                        added_count = {'tables': 0, 'screens': 0, 'logs': 0, 'situation_types': 0}
+                        
+                        # 테이블 추가
+                        if used_items.get('tables'):
+                            current_tables = [table_list.item(i).text() for i in range(table_list.count())]
+                            for table in used_items['tables']:
+                                if table and table not in current_tables:
+                                    table_list.addItem(table)
+                                    current_tables.append(table)
+                                    added_count['tables'] += 1
+                            if added_count['tables'] > 0:
+                                all_tables = [table_list.item(i).text() for i in range(table_list.count())]
+                                save_tables(all_tables)
+                                print(f"✅ {added_count['tables']}개 테이블이 목록에 추가되었습니다.")
+                        
+                        # 화면 추가
+                        if used_items.get('screens'):
+                            current_screens = [screen_list.item(i).text() for i in range(screen_list.count())]
+                            for screen in used_items['screens']:
+                                if screen and screen not in current_screens:
+                                    screen_list.addItem(screen)
+                                    current_screens.append(screen)
+                                    added_count['screens'] += 1
+                            if added_count['screens'] > 0:
+                                all_screens = [screen_list.item(i).text() for i in range(screen_list.count())]
+                                save_screens(all_screens)
+                                print(f"✅ {added_count['screens']}개 화면이 목록에 추가되었습니다.")
+                        
+                        # 로그 추가
+                        if used_items.get('logs'):
+                            current_logs = [log_list.item(i).text() for i in range(log_list.count())]
+                            for log in used_items['logs']:
+                                if log and log not in current_logs:
+                                    log_list.addItem(log)
+                                    current_logs.append(log)
+                                    added_count['logs'] += 1
+                            if added_count['logs'] > 0:
+                                all_logs = [log_list.item(i).text() for i in range(log_list.count())]
+                                save_logs(all_logs)
+                                print(f"✅ {added_count['logs']}개 로그가 목록에 추가되었습니다.")
+                        
+                        # 상황 유형 추가
+                        if used_items.get('situation_types'):
+                            current_situation_types = [situation_list.item(i).text() for i in range(situation_list.count())]
+                            for stype in used_items['situation_types']:
+                                if stype and stype not in current_situation_types:
+                                    situation_list.addItem(stype)
+                                    current_situation_types.append(stype)
+                                    added_count['situation_types'] += 1
+                            if added_count['situation_types'] > 0:
+                                all_situation_types = [situation_list.item(i).text() for i in range(situation_list.count())]
+                                save_situation_types(all_situation_types)
+                                print(f"✅ {added_count['situation_types']}개 상황 유형이 목록에 추가되었습니다.")
+                        
+                        # 모든 노드의 드롭다운 업데이트 (약간의 지연 후 실행하여 노드가 완전히 로드된 후 업데이트)
+                        def update_all_node_dropdowns():
+                            """모든 노드의 드롭다운을 업데이트"""
+                            try:
+                                # 항목이 추가되었거나, 노드가 로드되었으면 모든 드롭다운 업데이트
+                                if (added_count['tables'] > 0 or 
+                                    added_count['screens'] > 0 or 
+                                    added_count['logs'] > 0 or 
+                                    added_count['situation_types'] > 0):
+                                    update_node_tables()
+                                    update_node_screens()
+                                    update_node_logs()
+                                    update_node_situation_types()
+                                    print("✅ 모든 노드의 드롭다운이 업데이트되었습니다.")
+                            except Exception as e:
+                                print(f"⚠️ 노드 드롭다운 업데이트 중 오류: {e}")
+                                import traceback
+                                traceback.print_exc()
+                        
+                        # 500ms 후에 업데이트 (노드가 완전히 로드된 후)
+                        QtCore.QTimer.singleShot(500, update_all_node_dropdowns)
+                        
+                        # 메시지 구성
+                        added_summary = []
+                        if added_count['tables'] > 0:
+                            added_summary.append(f"테이블 {added_count['tables']}개")
+                        if added_count['screens'] > 0:
+                            added_summary.append(f"화면 {added_count['screens']}개")
+                        if added_count['logs'] > 0:
+                            added_summary.append(f"로그 {added_count['logs']}개")
+                        if added_count['situation_types'] > 0:
+                            added_summary.append(f"상황 유형 {added_count['situation_types']}개")
+                        
+                        message = f"워크플로우를 성공적으로 불러왔습니다!\n\n파일: {filename}\n형식: {file_type}\n노드 수: {len(result.get('steps', []))}개"
+                        if added_summary:
+                            message += f"\n\n✅ 목록에 자동 추가됨: {', '.join(added_summary)}"
+                        message += "\n\n(워크플로우 파일에서 첨부 파일들도 함께 복원되었습니다.)"
+                        
                         QtWidgets.QMessageBox.information(
                             main_window,
                             "불러오기 완료 ✅",
-                            f"워크플로우가 성공적으로 불러와졌습니다!\n\n파일: {filename}\n형식: {file_type}\n노드 수: {len(result.get('steps', []))}개\n\n(워크플로우 파일에서 첨부 파일들도 함께 복원되었습니다.)"
+                            message
                         )
                         print(f"✅ 불러오기 완료: {len(result.get('steps', []))}개의 노드가 불러와졌습니다.")
                     else:
@@ -3123,7 +4080,8 @@ if __name__ == '__main__':
     
     # 메뉴바에 파일 메뉴 추가
     try:
-        menu_bar = main_window.menuBar()
+        title_bar_widget = getattr(main_window, 'title_bar', None)
+        menu_bar = title_bar_widget.menu_bar if title_bar_widget else main_window.menuBar()
         if menu_bar:
             file_menu = menu_bar.addMenu("파일 (File)")
             
@@ -3198,7 +4156,24 @@ if __name__ == '__main__':
             fit_action.triggered.connect(fit_to_view)
             fit_action.setToolTip("모든 노드가 보이도록 적절한 배율로 줌합니다")
             
+            reset_panels_action = view_menu.addAction("패널 초기화 (Ctrl+Shift+R)")
+            reset_panels_action.setShortcut("Ctrl+Shift+R")
+            reset_panels_action.setToolTip("모든 패널을 기본 배치로 복원합니다")
+            reset_panels_action.triggered.connect(reset_panel_layout)
+            
             print("✅ 메뉴바에 보기 메뉴 추가 완료")
+
+            # 도움말 메뉴 추가
+            help_menu = menu_bar.addMenu("도움말 (Help)")
+            about_action = help_menu.addAction("ℹ 프로그램 정보")
+            about_action.setToolTip("프로그램 설명과 제작 정보를 확인합니다")
+            about_action.triggered.connect(show_about_dialog)
+            print("✅ 메뉴바에 도움말 메뉴 추가 완료")
+
+            export_menu = menu_bar.addMenu("Export")
+            export_plain_action = export_menu.addAction("JSON 내보내기 (위치 제외)")
+            export_plain_action.setToolTip("노드 위치를 제외한 JSON을 저장합니다")
+            export_plain_action.triggered.connect(lambda: on_export_plain_json(export_to_plain_json))
     except Exception as e:
         print(f"⚠️ 메뉴바 추가 실패: {e}")
     
